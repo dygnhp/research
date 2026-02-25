@@ -1,0 +1,25 @@
+# --- IDE/System Files ---
+.idea/                 # PyCharm settings
+.vscode/               # VS Code settings
+.DS_Store              # macOS system files
+Thumbs.db              # Windows system files
+
+# --- Python ---
+__pycache__/           # Python compiled files
+*.py[cod]              # Python bytecode
+venv/                  # Virtual environment
+env/
+.env                   # Environment variables (Secrets)
+
+# --- Data & Weights (가장 중요) ---
+datasets/              # Raw data
+data/
+outputs/               # Simulation results
+*.npy                  # JAX/NumPy binary data
+*.csv                  # Raw CSV data
+*.h5                   # Model weights
+*.pt                   # PyTorch weights
+*.ckpt                 # Checkpoints
+
+# --- JAX/XLA ---
+jax_cache/             # JAX compilation cache
