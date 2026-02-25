@@ -1,24 +1,73 @@
 """
-Block I: Contact Hamiltonian Fluid Neural Network — Forward Simulator
-=====================================================================
-Physics: Particles flow over an RBF potential landscape under contact
-         Hamiltonian dynamics with damping γ. Phase-space volume contracts
-         as exp(-3γt), and particles converge to class-specific attractors.
+=============================================================================
+Contact Hamiltonian Fluid Neural Network -- Block I Forward Simulator
+=============================================================================
+Physics:   Contact Hamiltonian dynamics with RBF potential landscape
+Math:      dq/dt = p,  dp/dt = -grad V - gamma*p,  dz/dt = ||p||^2 - H
+Backend:   JAX (CUDA) -- JIT-compiled RK4 via jax.lax.scan
+Target HW: Windows 11 + NVIDIA GPU (RTX 4060) + Intel CPU via WSL2
+
+Install (WSL2 with CUDA 12):
+    pip install --upgrade "jax[cuda12]" matplotlib scipy
+
+NOTE on physics parameters:
+  The K=4 fixed parameters have limited convergence because both O- and X-
+  image particles start in [0,7]^2, while the X-attractor is at (-8,-8) --
+  distance ~16, far outside the Gaussian support (3*sigma=6).
+  This is intentional: Block I tests the INFRASTRUCTURE (RK4, energy
+  decrease, contact geometry). Block II will LEARN optimal parameters.
+
+NOTE on phase-volume computation:
+  At t=0, all p_i=0 -> p-subspace has zero variance -> 6D covariance is
+  rank-deficient. We find the first "active" timestep t_ref and normalize
+  from there, comparing to exp(-3*gamma*(t - t_ref)).
+=============================================================================
 """
 
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.7"
+
+import jax
+import jax.numpy as jnp
+from jax import jit, vmap
+from functools import partial
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.colors import TwoSlopeNorm
-import warnings
-warnings.filterwarnings('ignore')
+from matplotlib.gridspec import GridSpec
+import time
 
-# ─────────────────────────────────────────────────────────────────
-# TEST DATA
-# ─────────────────────────────────────────────────────────────────
+print("=" * 60)
+print("JAX version  :", jax.__version__)
+print("Devices      :", jax.devices())
+print("Default backend:", jax.default_backend())
+print("=" * 60)
 
+# ---------------------------------------------------------------------------
+# 1. Global constants
+# ---------------------------------------------------------------------------
+GAMMA    = 1.5
+T_FINAL  = 10.0
+DT       = 0.05
+N_STEPS  = int(T_FINAL / DT)   # 200
+N_MAX    = 64
+TAU      = 0.5
+
+Q_STAR_O = jnp.array([ 8.0,  8.0, 0.0])
+Q_STAR_X = jnp.array([-8.0, -8.0, 0.0])
+
+W_INIT     = jnp.array([-2.0, -2.0,  1.5, -0.5])
+MU_INIT    = jnp.array([[ 8.0,  8.0, 0.5],
+                          [-8.0, -8.0, 0.5],
+                          [ 0.0,  0.0, 0.5],
+                          [ 4.0,  4.0, 0.5]], dtype=jnp.float32)
+SIGMA_INIT = jnp.array([2.0, 2.0, 2.0, 3.0])
+
+# ---------------------------------------------------------------------------
+# 2. Test images
+# ---------------------------------------------------------------------------
 O_IMAGE = np.array([
     [0,0,0,0,0,0,0,0],
     [0,0,1,1,1,1,0,0],
@@ -41,610 +90,473 @@ X_IMAGE = np.array([
     [1,0,0,0,0,0,0,1],
 ], dtype=float)
 
-# ─────────────────────────────────────────────────────────────────
-# RBF PARAMETERS (K=4, fixed for Block I)
-# ─────────────────────────────────────────────────────────────────
-
-W   = np.array([-2.0, -2.0,  1.5, -0.5])          # weights
-MU  = np.array([
-    [ 8.0,  8.0, 0.5],   # k=0: O-class attractor
-    [-8.0, -8.0, 0.5],   # k=1: X-class attractor
-    [ 0.0,  0.0, 0.5],   # k=2: barrier
-    [ 4.0,  4.0, 0.5],   # k=3: path guide
-])
-SIGMA = np.array([2.0, 2.0, 2.0, 3.0])             # widths
-
-# Target convergence points
-Q_STAR_O = np.array([ 8.0,  8.0, 0.0])
-Q_STAR_X = np.array([-8.0, -8.0, 0.0])
-
-# Simulation parameters
-GAMMA  = 1.5
-T_END  = 10.0
-DT     = 0.05
-N_STEP = int(T_END / DT)   # 200
-N_MAX  = 64
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PART A: PREPROCESSING
-# ═══════════════════════════════════════════════════════════════════
-
-def preprocess(image, tau=0.5, N_max=64):
+# ---------------------------------------------------------------------------
+# 3. Preprocessing
+# ---------------------------------------------------------------------------
+def preprocess(image, tau=TAU, n_max=N_MAX):
     """
-    Convert an 8×8 binary image to particle initial conditions.
-
-    Coordinate convention:
-        row r, col c  →  x = c,  y = 7 - r   (y increases upward)
-    This ensures O-image pixels cluster near upper-right → attractor (8,8,0).
-
-    Returns:
-        q0   : (N_max, 3)  initial positions  [x, y, intensity]
-        p0   : (N_max, 3)  initial momenta    [0, 0, 0]
-        z0   : (N_max,)    contact variable   [0, ...]
-        mask : (N_max,)    bool, True for real particles
+    Convert 8x8 image to JAX state arrays.
+    Coordinate convention: row r, col c -> x=c, y=7-r (y increases upward)
+    State per particle: [q_x, q_y, q_z(intensity), p_x, p_y, p_z, z_contact]
+    Note: q[2] = pixel intensity (initial z-position lift)
+          S[6]  = contact variable z_i(t) (dissipated energy), starts at 0
     """
-    rows, cols = np.where(image > tau)
-    xs = cols.astype(float)           # x = column index
-    ys = (7 - rows).astype(float)     # y = flipped row  (y↑)
-    intensities = image[rows, cols]   # pixel value (1.0 for binary)
+    rows, cols = image.shape
+    q_list = []
+    for r in range(rows):
+        for c in range(cols):
+            if image[r, c] > tau:
+                q_list.append([float(c), float(rows-1-r), float(image[r,c])])
 
-    N_real = len(xs)
-    assert N_real > 0, "No real particles found — check threshold"
+    n_real = len(q_list)
+    assert n_real > 0, "No real particles -- check tau"
+    assert n_real <= n_max
 
-    q0   = np.zeros((N_max, 3))
-    p0   = np.zeros((N_max, 3))
-    z0   = np.zeros(N_max)
-    mask = np.zeros(N_max, dtype=bool)
+    q0_np   = np.zeros((n_max, 3), dtype=np.float32)
+    p0_np   = np.zeros((n_max, 3), dtype=np.float32)
+    z0_np   = np.zeros((n_max,),   dtype=np.float32)
+    mask_np = np.zeros((n_max,),   dtype=bool)
 
-    # Fill real particles
-    q0[:N_real, 0] = xs
-    q0[:N_real, 1] = ys
-    q0[:N_real, 2] = intensities      # 3rd q-component = pixel intensity
-    mask[:N_real]  = True
+    for i, pos in enumerate(q_list):
+        q0_np[i] = pos
+        mask_np[i] = True
 
-    # Dummy particles remain at origin with mask=False
+    q0   = jnp.array(q0_np)
+    p0   = jnp.array(p0_np)
+    z0   = jnp.array(z0_np)
+    mask = jnp.array(mask_np)
+    assert q0.shape == (n_max, 3)
+    assert p0.shape == (n_max, 3)
+    assert int(mask.sum()) > 0
 
-    # Shape assertions
-    assert q0.shape == (64, 3), "Initial position shape error"
-    assert p0.shape == (64, 3), "Initial momentum shape error"
-    assert mask.sum() > 0,       "No real particles found — check threshold"
-
+    print(f"  Preprocessed: {n_real} real / {n_max} total")
     return q0, p0, z0, mask
 
-
-# ═══════════════════════════════════════════════════════════════════
-# PART B: RBF POTENTIAL AND GRADIENT
-# ═══════════════════════════════════════════════════════════════════
-
+# ---------------------------------------------------------------------------
+# 4. RBF Potential and Gradient
+# ---------------------------------------------------------------------------
+@jit
 def rbf_potential(q, w, mu, sigma):
     """
-    V(q; θ) = Σ_k  w_k · exp( -‖q - μ_k‖² / (2σ_k²) )
-
-    Args:
-        q     : (N, 3)  particle positions
-        w     : (K,)    RBF weights
-        mu    : (K, 3)  RBF centers
-        sigma : (K,)    RBF widths
-    Returns:
-        V     : (N,)    potential energy per particle
+    V(q_i) = sum_k w_k * exp(-||q_i - mu_k||^2 / (2*sigma_k^2))
+    q:(N,3) w:(K,) mu:(K,3) sigma:(K,) -> V:(N,)
     """
-    # diff[k,i,:] = q[i] - mu[k]   →  broadcast: (K,1,3) vs (1,N,3)
-    diff = q[np.newaxis, :, :] - mu[:, np.newaxis, :]   # (K, N, 3)
-    r2   = np.sum(diff**2, axis=2)                       # (K, N)  squared distances
-    # Gaussian kernel per RBF center
-    gauss = np.exp(-r2 / (2.0 * sigma[:, np.newaxis]**2))  # (K, N)
-    # Weighted sum over K centers
-    V = np.einsum('k,kn->n', w, gauss)                   # (N,)
-    return V
+    diff    = q[:, None, :] - mu[None, :, :]           # (N, K, 3)
+    sq_dist = jnp.sum(diff**2, axis=-1)                 # (N, K)
+    gauss   = jnp.exp(-sq_dist / (2.0 * sigma**2))     # (N, K)
+    return jnp.sum(w * gauss, axis=-1)                  # (N,)
 
 
+@jit
 def rbf_gradient(q, w, mu, sigma):
     """
-    ∇_q V(q; θ) = Σ_k  w_k · exp(-‖q-μ_k‖²/2σ_k²) · (-(q - μ_k)/σ_k²)
-
-    Returns:
-        grad  : (N, 3)  gradient of V w.r.t. q for each particle
+    grad_{q_i} V = sum_k w_k * exp(...) * (-(q_i - mu_k) / sigma_k^2)
+    q:(N,3) -> grad:(N,3)
     """
-    diff  = q[np.newaxis, :, :] - mu[:, np.newaxis, :]    # (K, N, 3)
-    r2    = np.sum(diff**2, axis=2)                         # (K, N)
-    gauss = np.exp(-r2 / (2.0 * sigma[:, np.newaxis]**2))  # (K, N)
+    diff    = q[:, None, :] - mu[None, :, :]
+    sq_dist = jnp.sum(diff**2, axis=-1)
+    gauss   = jnp.exp(-sq_dist / (2.0 * sigma**2))
+    factor  = w * gauss / (sigma**2)                   # (N, K)
+    return jnp.sum(-factor[:, :, None] * diff, axis=1) # (N, 3)
 
-    # Factor: w_k * gauss_k / sigma_k²   shape (K, N)
-    factor = (w[:, np.newaxis] * gauss
-              / sigma[:, np.newaxis]**2)                    # (K, N)
-
-    # grad = Σ_k  factor[k,i] * (-diff[k,i,:])
-    grad = -np.einsum('kn,knd->nd', factor, diff)          # (N, 3)
-    return grad
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PART C: CONTACT HAMILTONIAN ODE (RHS)
-# ═══════════════════════════════════════════════════════════════════
-
+# ---------------------------------------------------------------------------
+# 5. Contact Hamiltonian RHS
+# ---------------------------------------------------------------------------
+@jit
 def contact_rhs(S, w, mu, sigma, gamma):
     """
     Contact Hamilton's equations:
-
         dq/dt = p
-        dp/dt = -∇V(q) - γ·p          ← damped Newton (contact correction)
-        dz/dt = ‖p‖² - H              ← contact variable tracks energy dissipation
+        dp/dt = -grad_q V(q) - gamma * p
+        dz/dt = ||p||^2 - H_i    where H_i = ||p||^2/2 + V(q)
 
-    where H = ‖p‖²/2 + V(q)  (mechanical Hamiltonian)
+    Physical interpretation:
+        dH_i/dt = -gamma * ||p_i||^2 <= 0  (energy monotone decrease)
+        div(X_contact) = -gamma per DoF  --> V_phase ~ exp(-3*gamma*t)
+        This intentionally BREAKS Liouville's theorem (Contact geometry).
 
-    Args:
-        S     : (N_max, 7)  state [q(3), p(3), z(1)]
-        w, mu, sigma        RBF parameters
-        gamma               damping coefficient
-    Returns:
-        dS/dt : (N_max, 7)
+    S:(N_max, 7)  gamma: Python float
+    S layout: [:, 0:3]=q  [:, 3:6]=p  [:, 6]=z_contact
     """
-    q = S[:, :3]    # (N_max, 3)  positions
-    p = S[:, 3:6]   # (N_max, 3)  momenta
-    # z = S[:, 6]   # (N_max,)    contact variable (not needed for rhs directly)
+    q      = S[:, :3]
+    p      = S[:, 3:6]
+    V      = rbf_potential(q, w, mu, sigma)          # (N,)
+    gV     = rbf_gradient(q, w, mu, sigma)           # (N, 3)
+    p_sq   = jnp.sum(p**2, axis=-1)                 # (N,)
+    H_i    = p_sq / 2.0 + V                          # (N,)
 
-    V    = rbf_potential(q, w, mu, sigma)       # (N_max,)
-    gradV = rbf_gradient(q, w, mu, sigma)       # (N_max, 3)
+    dq_dt  = p
+    dp_dt  = -gV - gamma * p
+    dz_dt  = p_sq - H_i
 
-    p2   = np.sum(p**2, axis=1)                 # (N_max,)  ‖p‖²
-    H    = 0.5 * p2 + V                         # (N_max,)  Hamiltonian
+    return jnp.concatenate([dq_dt, dp_dt, dz_dt[:, None]], axis=-1)
 
-    dq = p                                      # (N_max, 3)
-    dp = -gradV - gamma * p                     # (N_max, 3)  damped force
-    dz = p2 - H                                 # (N_max,)    contact eq.
-
-    dS = np.concatenate([dq, dp, dz[:, np.newaxis]], axis=1)  # (N_max, 7)
-    return dS
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PART D: RK4 INTEGRATOR
-# ═══════════════════════════════════════════════════════════════════
-
-def rk4_step(S, dt, w, mu, sigma, gamma):
+# ---------------------------------------------------------------------------
+# 6. RK4 Step
+# ---------------------------------------------------------------------------
+@partial(jit, static_argnums=(4, 5))
+def rk4_step(S, w, mu, sigma, gamma, dt):
     """
-    Single 4th-order Runge-Kutta step.
-
+    Classical RK4: S_new = S + (dt/6)(k1 + 2k2 + 2k3 + k4)
+    gamma, dt are Python scalars (static) -- avoids re-tracing in lax.scan.
+    """
+    f  = partial(contact_rhs, w=w, mu=mu, sigma=sigma, gamma=gamma)
     k1 = f(S)
-    k2 = f(S + dt/2 · k1)
-    k3 = f(S + dt/2 · k2)
-    k4 = f(S + dt   · k3)
-    S_new = S + dt/6 · (k1 + 2k2 + 2k3 + k4)
+    k2 = f(S + 0.5*dt*k1)
+    k3 = f(S + 0.5*dt*k2)
+    k4 = f(S +     dt*k3)
+    return S + (dt/6.0)*(k1 + 2.0*k2 + 2.0*k3 + k4)
+
+# ---------------------------------------------------------------------------
+# 7. Full Simulation via jax.lax.scan
+# ---------------------------------------------------------------------------
+def simulate(image, w, mu, sigma, gamma=GAMMA, T=T_FINAL, dt=DT, tau=TAU):
     """
-    f = lambda s: contact_rhs(s, w, mu, sigma, gamma)
-
-    k1 = f(S)
-    k2 = f(S + 0.5 * dt * k1)
-    k3 = f(S + 0.5 * dt * k2)
-    k4 = f(S + dt * k3)
-
-    return S + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PART E: FULL SIMULATION
-# ═══════════════════════════════════════════════════════════════════
-
-def simulate(image, w, mu, sigma, gamma=1.5, T=10.0, dt=0.05, tau=0.5):
+    Full simulation using lax.scan for GPU-compiled time loop.
+    Returns trajectory (N_steps+1, N_max, 7) and mask (N_max,).
     """
-    Run full contact Hamiltonian simulation.
+    print("  Preprocessing...")
+    q0, p0, z0, mask = preprocess(image, tau=tau)
+    S0      = jnp.concatenate([q0, p0, z0[:, None]], axis=-1)  # (N_max, 7)
+    n_steps = int(round(T / dt))
 
-    Returns:
-        trajectory : (N_step+1, N_max, 7)  full state history
-        mask       : (N_max,) bool          real particle mask
-    """
-    q0, p0, z0, mask = preprocess(image, tau=tau, N_max=N_MAX)
+    @jit
+    def step(S, _):
+        S_new = rk4_step(S, w, mu, sigma, gamma, dt)
+        return S_new, S_new
 
-    N_step = int(round(T / dt))
+    print(f"  lax.scan: {n_steps} RK4 steps (JIT-compiled for GPU)...")
+    t0 = time.time()
+    _, steps = jax.lax.scan(step, S0, None, length=n_steps)
+    steps.block_until_ready()
+    print(f"  Done in {time.time()-t0:.3f}s")
 
-    # Pack initial state: S[i] = [q_i(3), p_i(3), z_i(1)]
-    S = np.concatenate([q0, p0, z0[:, np.newaxis]], axis=1)  # (64, 7)
+    trajectory = jnp.concatenate([S0[None], steps], axis=0)  # (N_steps+1, N_max, 7)
 
-    trajectory = np.zeros((N_step + 1, N_MAX, 7))
-    trajectory[0] = S
-
-    for step in range(N_step):
-        S = rk4_step(S, dt, w, mu, sigma, gamma)
-        trajectory[step + 1] = S
-
-        # NaN/Inf guard
-        if not np.all(np.isfinite(S)):
-            first_bad = np.argwhere(~np.isfinite(S))
-            print(f"[ERROR] NaN/Inf detected at timestep {step+1}, "
-                  f"first occurrence: particle {first_bad[0,0]}, "
-                  f"state index {first_bad[0,1]}")
-            trajectory = trajectory[:step+2]
-            break
-
-    assert np.all(np.isfinite(trajectory)), "NaN/Inf detected in trajectory"
-
+    if bool(jnp.any(~jnp.isfinite(trajectory))):
+        bad = jnp.where(
+            ~jnp.all(jnp.isfinite(trajectory.reshape(n_steps+1,-1)), axis=-1))[0]
+        raise ValueError(f"NaN/Inf at steps: {bad[:5]}")
+    print("  Sanity: all finite.")
     return trajectory, mask
 
+# ---------------------------------------------------------------------------
+# 8. Analysis Functions
+# ---------------------------------------------------------------------------
+@jit
+def com_single(q_t, mask):
+    """CoM of real particles at one timestep. Returns shape (3,)."""
+    mf = mask.astype(jnp.float32)
+    return jnp.sum(q_t * mf[:, None], axis=0) / jnp.sum(mf)
 
-# ═══════════════════════════════════════════════════════════════════
-# PART F: ANALYSIS FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════
 
 def compute_com(trajectory, mask):
-    """
-    Center of Mass over real particles at each timestep.
-
-    Returns:
-        q_com : (N_step+1, 3)
-    """
-    # trajectory: (T, N_max, 7), mask: (N_max,)
-    q = trajectory[:, mask, :3]          # (T, N_real, 3)
-    q_com = q.mean(axis=1)               # (T, 3)
-    return q_com
+    """Returns (N_steps+1, 3) CoM trajectory."""
+    fn = vmap(lambda qt: com_single(qt, mask))
+    return fn(trajectory[:, :, :3])
 
 
 def compute_hamiltonian(trajectory, mask, w, mu, sigma):
     """
-    Mechanical Hamiltonian H_i(t) = ‖p_i‖²/2 + V(q_i) for real particles.
-
-    Returns:
-        H_real : (N_step+1, N_real)
+    H_i(t) = ||p_i||^2/2 + V(q_i) for all real particles.
+    Theory: dH_i/dt = -gamma * ||p_i||^2 <= 0.
+    Returns (N_steps+1, N_real).
     """
-    T_steps = trajectory.shape[0]
-    N_real  = mask.sum()
-    H_all   = np.zeros((T_steps, N_real))
-
-    q_all = trajectory[:, mask, :3]   # (T, N_real, 3)
-    p_all = trajectory[:, mask, 3:6]  # (T, N_real, 3)
-
-    for t in range(T_steps):
-        V  = rbf_potential(q_all[t], w, mu, sigma)   # (N_real,)
-        p2 = np.sum(p_all[t]**2, axis=1)             # (N_real,)
-        H_all[t] = 0.5 * p2 + V
-
-    return H_all
+    m_np = np.array(mask, dtype=bool)
+    H_list = []
+    for t in range(trajectory.shape[0]):
+        q_t = trajectory[t, :, :3]
+        p_t = trajectory[t, :, 3:6]
+        H_t = jnp.sum(p_t**2, axis=-1)/2.0 + rbf_potential(q_t, w, mu, sigma)
+        H_list.append(np.array(H_t[m_np]))
+    return np.stack(H_list, axis=0)  # (N_steps+1, N_real)
 
 
 def compute_phase_volume(trajectory, mask):
     """
-    Approximate phase-space volume via covariance matrix determinant.
+    Phase-space volume via 6D covariance determinant:
+        V_phase(t) = sqrt(det(Cov([q(t), p(t)])))
 
-    joint(t) = [q_real(t), p_real(t)]  shape (N_real, 6)
-    V_phase(t) = sqrt(det(Cov(joint) + ε·I))
+    Handles p(0)=0 singularity:
+        Finds first "active" t_ref where det > 0.1% of max,
+        returns ratio normalized from t_ref.
 
-    Returns:
-        vol_ratio : (N_step+1,)   V_phase(t) / V_phase(0)
+    Returns: (vol_ratio, t_ref_idx)
     """
-    T_steps = trajectory.shape[0]
-    vols    = np.zeros(T_steps)
+    m_np  = np.array(mask, dtype=bool)
+    n_t   = trajectory.shape[0]
+    eps   = 1e-10
+    v_arr = np.zeros(n_t, dtype=np.float64)
 
-    q_all = trajectory[:, mask, :3]   # (T, N_real, 3)
-    p_all = trajectory[:, mask, 3:6]  # (T, N_real, 3)
+    for t in range(n_t):
+        q_r = np.array(trajectory[t, m_np, :3])
+        p_r = np.array(trajectory[t, m_np, 3:6])
+        jnt = np.concatenate([q_r, p_r], axis=1)
+        if jnt.shape[0] < 2:
+            continue
+        cov     = np.cov(jnt.T) + eps*np.eye(6)
+        v_arr[t] = np.sqrt(max(np.linalg.det(cov), 0.0))
 
-    for t in range(T_steps):
-        joint = np.concatenate([q_all[t], p_all[t]], axis=1)  # (N_real, 6)
-        cov   = np.cov(joint.T)                                # (6, 6)
-        # Regularize to avoid singular matrix
-        det   = np.linalg.det(cov + 1e-10 * np.eye(6))
-        vols[t] = np.sqrt(np.abs(det))
+    v_max = v_arr.max()
+    if v_max < 1e-30:
+        return np.ones(n_t), 0
 
-    # Normalize by t=0
-    vol0 = vols[0] if vols[0] > 0 else 1.0
-    return vols / vol0
-
-
-def classify(trajectory, mask, q_star_O, q_star_X):
-    """
-    Classify based on final CoM proximity to attractors.
-
-    Returns:
-        pred    : 'O' or 'X'
-        dist_O  : distance to O-attractor
-        dist_X  : distance to X-attractor
-        q_com_f : final CoM position (3,)
-    """
-    q_com   = compute_com(trajectory, mask)    # (T, 3)
-    q_com_f = q_com[-1]                        # final CoM
-
-    dist_O = np.linalg.norm(q_com_f - q_star_O)
-    dist_X = np.linalg.norm(q_com_f - q_star_X)
-
-    pred = 'O' if dist_O < dist_X else 'X'
-    return pred, dist_O, dist_X, q_com_f
+    active    = np.where(v_arr > 0.001 * v_max)[0]
+    t_ref_idx = int(active[0]) if len(active) else 0
+    v_ref     = v_arr[t_ref_idx]
+    ratio     = np.where(v_ref > 0, v_arr / v_ref, 0.0)
+    return ratio, t_ref_idx
 
 
-# ═══════════════════════════════════════════════════════════════════
-# PART G: VERIFICATION AND PLOTTING
-# ═══════════════════════════════════════════════════════════════════
+def classify(trajectory, mask, qO=Q_STAR_O, qX=Q_STAR_X):
+    """Classify by final CoM distance to each attractor."""
+    qf  = com_single(trajectory[-1, :, :3], mask)
+    dO  = float(jnp.linalg.norm(qf - qO))
+    dX  = float(jnp.linalg.norm(qf - qX))
+    return ('O' if dO < dX else 'X'), dO, dX, qf
 
-def verify_and_plot(traj_O, mask_O, traj_X, mask_X, w, mu, sigma, t_array):
-    """
-    Generate 2×3 verification figure.
-    """
-    gamma = GAMMA
+# ---------------------------------------------------------------------------
+# 9. Verification and 6-Panel Figure
+# ---------------------------------------------------------------------------
+def verify_and_plot(traj_O, mask_O, traj_X, mask_X,
+                    w, mu, sigma, t_arr,
+                    output_path="block1_verification.png"):
 
-    # ── Pre-compute all quantities ──────────────────────────────
+    print("\nComputing verification quantities...")
+    com_O = np.array(compute_com(traj_O, mask_O))
+    com_X = np.array(compute_com(traj_X, mask_X))
 
-    q_com_O = compute_com(traj_O, mask_O)     # (T, 3)
-    q_com_X = compute_com(traj_X, mask_X)
-
-    H_O = compute_hamiltonian(traj_O, mask_O, w, mu, sigma)  # (T, N_real_O)
+    print("  H(t)...")
+    H_O = compute_hamiltonian(traj_O, mask_O, w, mu, sigma)
     H_X = compute_hamiltonian(traj_X, mask_X, w, mu, sigma)
 
-    vol_O = compute_phase_volume(traj_O, mask_O)  # (T,)
-    vol_X = compute_phase_volume(traj_X, mask_X)
+    print("  V_phase(t)...")
+    vol_O, t_ref_O = compute_phase_volume(traj_O, mask_O)
+    vol_X, t_ref_X = compute_phase_volume(traj_X, mask_X)
 
-    # Convergence metrics
-    eps_q_O = np.linalg.norm(q_com_O - Q_STAR_O, axis=1)   # (T,)
-    eps_q_X = np.linalg.norm(q_com_X - Q_STAR_X, axis=1)
-
-    p_O = traj_O[:, mask_O, 3:6]    # (T, N_real, 3)
-    p_X = traj_X[:, mask_X, 3:6]
-    eps_p_O = np.mean(np.linalg.norm(p_O, axis=2), axis=1)  # (T,)
-    eps_p_X = np.mean(np.linalg.norm(p_X, axis=2), axis=1)
-
-    # Theoretical volume contraction
-    vol_theory = np.exp(-3 * gamma * t_array)
-
-    # Classification
-    pred_O, dO_O, dX_O, qf_O = classify(traj_O, mask_O, Q_STAR_O, Q_STAR_X)
-    pred_X, dO_X, dX_X, qf_X = classify(traj_X, mask_X, Q_STAR_O, Q_STAR_X)
-
-    # ── PASS/FAIL checks ────────────────────────────────────────
-
-    # Energy monotone: dH/dt ≤ 0 (allow +1e-6 noise)
-    def check_energy_monotone(H):
-        diffs = np.diff(H, axis=0)    # (T-1, N_real)
-        bad   = np.sum(diffs > 1e-6)
-        total = diffs.size
-        return (bad / total) < 0.05   # >95% steps monotone
-
-    pass_energy_O = check_energy_monotone(H_O)
-    pass_energy_X = check_energy_monotone(H_X)
-
-    # Volume contraction R²
-    from numpy.polynomial import polynomial as P
-    def r2(y_true, y_pred):
-        ss_res = np.sum((y_true - y_pred)**2)
-        ss_tot = np.sum((y_true - y_true.mean())**2)
-        return 1 - ss_res / (ss_tot + 1e-30)
-
-    r2_O = r2(vol_O, vol_theory)
-    r2_X = r2(vol_X, vol_theory)
-    pass_vol_O = r2_O > 0.90
-    pass_vol_X = r2_X > 0.90
+    # Theory curves from t_ref (where p-distribution first has spread)
+    thr_O = np.exp(-3.0*GAMMA*(t_arr - t_arr[t_ref_O]))
+    thr_X = np.exp(-3.0*GAMMA*(t_arr - t_arr[t_ref_X]))
+    thr_O[:t_ref_O] = 1.0
+    thr_X[:t_ref_X] = 1.0
 
     # Convergence
-    pass_conv_O = (eps_q_O[-1] < 2.0) and (eps_p_O[-1] < 0.5)
-    pass_conv_X = (eps_q_X[-1] < 2.0) and (eps_p_X[-1] < 0.5)
+    mO = np.array(mask_O, dtype=bool)
+    mX = np.array(mask_X, dtype=bool)
+    eps_q_O = np.linalg.norm(com_O - np.array(Q_STAR_O), axis=-1)
+    eps_q_X = np.linalg.norm(com_X - np.array(Q_STAR_X), axis=-1)
+    eps_p_O = np.mean(np.linalg.norm(np.array(traj_O[:, mO, 3:6]), axis=-1), axis=-1)
+    eps_p_X = np.mean(np.linalg.norm(np.array(traj_X[:, mX, 3:6]), axis=-1), axis=-1)
 
-    pass_cls_O = (pred_O == 'O')
-    pass_cls_X = (pred_X == 'X')
+    pred_O, dOO, dOX, cfO = classify(traj_O, mask_O)
+    pred_X, dXO, dXX, cfX = classify(traj_X, mask_X)
 
-    all_pass = all([pass_energy_O, pass_energy_X,
-                    pass_vol_O,    pass_vol_X,
-                    pass_conv_O,   pass_conv_X,
-                    pass_cls_O,    pass_cls_X])
+    # --- PASS/FAIL ---
+    def mono(H):
+        dH = np.diff(H, axis=0)
+        f  = 1.0 - np.sum(dH > 1e-6) / dH.size
+        return f >= 0.95, f
 
-    # ── Figure ──────────────────────────────────────────────────
+    emO, fO = mono(H_O)
+    emX, fX = mono(H_X)
+    energy_pass = emO and emX
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("Block I — Contact Hamiltonian Simulator Verification",
-                 fontsize=14, fontweight='bold')
+    def r2(yt, yp, s=0):
+        yt = yt[s:]; yp = yp[s:]
+        return 1.0 - np.sum((yt-yp)**2) / (np.sum((yt-yt.mean())**2) + 1e-12)
 
-    # ── [1,1] RBF Potential Contour ─────────────────────────────
-    ax = axes[0, 0]
-    gx = np.linspace(-12, 12, 300)
-    gy = np.linspace(-12, 12, 300)
-    GX, GY = np.meshgrid(gx, gy)
-    grid_q = np.stack([GX.ravel(), GY.ravel(),
-                       0.5 * np.ones(GX.size)], axis=1)   # (N_grid, 3)
-    GV = rbf_potential(grid_q, w, mu, sigma).reshape(GX.shape)
+    r2O = r2(vol_O, thr_O, t_ref_O)
+    r2X = r2(vol_X, thr_X, t_ref_X)
+    vol_pass  = (r2O > 0.90) and (r2X > 0.90)
+    conv_q    = (eps_q_O[-1] < 2.0) and (eps_q_X[-1] < 2.0)
+    conv_p    = (eps_p_O[-1] < 0.5) and (eps_p_X[-1] < 0.5)
+    conv_pass = conv_q and conv_p
+    cls_pass  = (pred_O == 'O') and (pred_X == 'X')
+    all_pass  = energy_pass and vol_pass and conv_pass and cls_pass
 
-    norm = TwoSlopeNorm(vmin=GV.min(), vcenter=0, vmax=GV.max())
-    cf = ax.contourf(GX, GY, GV, levels=40, cmap='RdBu_r', norm=norm, alpha=0.85)
-    ax.contour(GX, GY, GV, levels=15, colors='k', linewidths=0.4, alpha=0.4)
-    plt.colorbar(cf, ax=ax, label='V(q)')
+    # --- Report ---
+    S = "=" * 62
+    print(f"\n{S}\nBLOCK I VERIFICATION REPORT\n{S}")
+    print(f"  [ENERGY]  Monotone: {'PASS' if energy_pass else 'FAIL'}  O={fO:.3%} X={fX:.3%}")
+    print(f"  [VOLUME]  R^2:      {'PASS' if vol_pass else 'FAIL'}  O={r2O:.4f} X={r2X:.4f}")
+    print(f"  [CONV q]  eps_q:    {'PASS' if conv_q else 'FAIL'}  O={eps_q_O[-1]:.4f} X={eps_q_X[-1]:.4f}")
+    print(f"  [CONV p]  eps_p:    {'PASS' if conv_p else 'FAIL'}  O={eps_p_O[-1]:.4f} X={eps_p_X[-1]:.4f}")
+    print(f"  [CLASS]   correct:  {'PASS' if cls_pass else 'FAIL'}  O->{pred_O}  X->{pred_X}")
+    print(f"{S}")
+    print(f"  OVERALL: {'*** ALL PASS ***' if all_pass else '--- PARTIAL (see notes) ---'}")
+    if not cls_pass:
+        print("\n  NOTE: Classification FAIL is expected for fixed K=4 params.")
+        print("  X-attractor at (-8,-8) is distance ~16 from initial particles.")
+        print("  Gaussian support = 3*sigma = 6 -> force ~exp(-16^2/8) ~ 0.")
+        print("  Block II will learn attractor positions via adjoint gradient descent.")
+    print(S)
 
-    # Attractor stars
-    ax.plot(mu[0,0], mu[0,1], '*', ms=16, color='cyan',   zorder=5, label='μ_O (att)')
-    ax.plot(mu[1,0], mu[1,1], '*', ms=16, color='lime',   zorder=5, label='μ_X (att)')
-    ax.plot(mu[2,0], mu[2,1], '^', ms=12, color='orange', zorder=5, label='μ barrier')
-    ax.plot(mu[3,0], mu[3,1], 'D', ms=10, color='yellow', zorder=5, label='μ guide')
+    # --- Figure ---
+    print("\nBuilding figure...")
+    mu_np = np.array(mu)
 
-    # Initial particle positions
-    q0_O = traj_O[0, mask_O, :2]
-    q0_X = traj_X[0, mask_X, :2]
-    ax.scatter(q0_O[:,0], q0_O[:,1], c='blue',  s=15, zorder=6, label='O init')
-    ax.scatter(q0_X[:,0], q0_X[:,1], c='red',   s=15, zorder=6, label='X init')
+    fig = plt.figure(figsize=(18, 10))
+    gs  = GridSpec(2, 3, figure=fig, hspace=0.44, wspace=0.35)
+    a   = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(2)]
+    a11, a12, a13 = a[0]
+    a21, a22, a23 = a[1]
 
-    ax.set_xlim(-12, 12); ax.set_ylim(-12, 12)
-    ax.set_xlabel('x'); ax.set_ylabel('y')
-    ax.set_title("RBF Potential Landscape (z=0.5 slice)")
-    ax.legend(fontsize=6, loc='upper left')
+    # [1,1] Potential contour
+    xy = np.linspace(-12, 12, 300)
+    gx, gy = np.meshgrid(xy, xy)
+    q_g = jnp.array(np.stack([gx.ravel(), gy.ravel(),
+                                np.full(gx.size, 0.5)], axis=1).astype(np.float32))
+    Vg  = np.array(rbf_potential(q_g, w, mu, sigma)).reshape(gx.shape)
+    cf  = a11.contourf(gx, gy, Vg, levels=40, cmap='RdYlBu_r', alpha=0.85)
+    a11.contour(gx, gy, Vg, levels=20, colors='k', linewidths=0.3, alpha=0.4)
+    plt.colorbar(cf, ax=a11, shrink=0.85, label='V(q)')
+    for k, (col, mrk, sz, lab) in enumerate([
+            ('blue', '*', 220, 'O-attractor'),
+            ('red',  '*', 220, 'X-attractor'),
+            ('darkorange', '^', 160, 'Barrier'),
+            ('green', 'D', 110, 'Path guide')]):
+        a11.scatter(*mu_np[k, :2], s=sz, c=col, marker=mrk, zorder=6, label=lab)
+    q0O = np.array(traj_O[0, mO, :2])
+    q0X = np.array(traj_X[0, mX, :2])
+    a11.scatter(q0O[:,0], q0O[:,1], s=18, c='blue', alpha=0.7, label='O init')
+    a11.scatter(q0X[:,0], q0X[:,1], s=18, c='red',  alpha=0.7, label='X init')
+    a11.set(xlim=(-12,12), ylim=(-12,12), xlabel='x', ylabel='y',
+            title='RBF Potential Landscape (z=0.5 slice)')
+    a11.legend(fontsize=6.5, loc='upper right', framealpha=0.8)
 
-    # ── [1,2] Particle Trajectories ─────────────────────────────
-    ax = axes[0, 1]
-    q_traj_O = traj_O[:, mask_O, :2]   # (T, N_real_O, 2)
-    q_traj_X = traj_X[:, mask_X, :2]
+    # [1,2] Trajectories
+    tOnp = np.array(traj_O[:, mO, :])
+    tXnp = np.array(traj_X[:, mX, :])
+    dec  = max(1, N_STEPS//50)
+    for i in range(tOnp.shape[1]):
+        a12.plot(tOnp[::dec,i,0], tOnp[::dec,i,1], 'b-', alpha=0.2, lw=0.6)
+    for i in range(tXnp.shape[1]):
+        a12.plot(tXnp[::dec,i,0], tXnp[::dec,i,1], 'r-', alpha=0.2, lw=0.6)
+    a12.scatter(tOnp[0,:,0],  tOnp[0,:,1],  c='blue', s=12, marker='o', zorder=4)
+    a12.scatter(tOnp[-1,:,0], tOnp[-1,:,1], c='blue', s=25, marker='x', zorder=5)
+    a12.scatter(tXnp[0,:,0],  tXnp[0,:,1],  c='red',  s=12, marker='o', zorder=4)
+    a12.scatter(tXnp[-1,:,0], tXnp[-1,:,1], c='red',  s=25, marker='x', zorder=5)
+    a12.scatter(*np.array(Q_STAR_O)[:2], s=280, c='blue', marker='*', zorder=6, label='q*_O')
+    a12.scatter(*np.array(Q_STAR_X)[:2], s=280, c='red',  marker='*', zorder=6, label='q*_X')
+    a12.plot(com_O[::dec,0], com_O[::dec,1], 'b-', lw=2.5, label='CoM O')
+    a12.plot(com_X[::dec,0], com_X[::dec,1], 'r-', lw=2.5, label='CoM X')
+    a12.set(xlabel='q_x', ylabel='q_y', title='Particle Trajectories (xy-projection)')
+    a12.legend(fontsize=8)
 
-    for i in range(q_traj_O.shape[1]):
-        ax.plot(q_traj_O[:,i,0], q_traj_O[:,i,1],
-                'b-', lw=0.5, alpha=0.3)
-        ax.plot(q_traj_O[0,i,0], q_traj_O[0,i,1], 'bo', ms=3, alpha=0.5)
-        ax.plot(q_traj_O[-1,i,0], q_traj_O[-1,i,1], 'bx', ms=4, alpha=0.8)
-
-    for i in range(q_traj_X.shape[1]):
-        ax.plot(q_traj_X[:,i,0], q_traj_X[:,i,1],
-                'r-', lw=0.5, alpha=0.3)
-        ax.plot(q_traj_X[0,i,0], q_traj_X[0,i,1], 'ro', ms=3, alpha=0.5)
-        ax.plot(q_traj_X[-1,i,0], q_traj_X[-1,i,1], 'rx', ms=4, alpha=0.8)
-
-    ax.plot(*Q_STAR_O[:2], '*', ms=18, color='cyan',
-            zorder=5, label='q* O attractor')
-    ax.plot(*Q_STAR_X[:2], '*', ms=18, color='lime',
-            zorder=5, label='q* X attractor')
-
-    ax.set_xlabel('x'); ax.set_ylabel('y')
-    ax.set_title("Particle Trajectories (xy-projection)")
-    ax.legend(fontsize=8)
-    ax.set_xlim(-12, 12); ax.set_ylim(-12, 12)
-
-    # ── [1,3] Energy Decrease ────────────────────────────────────
-    ax = axes[0, 2]
-    # Individual particle H (thin)
+    # [1,3] H(t)
     for i in range(H_O.shape[1]):
-        ax.plot(t_array, H_O[:, i], 'b-', lw=0.3, alpha=0.15)
+        a13.plot(t_arr, H_O[:,i], 'b-', alpha=0.07, lw=0.5)
     for i in range(H_X.shape[1]):
-        ax.plot(t_array, H_X[:, i], 'r-', lw=0.3, alpha=0.15)
+        a13.plot(t_arr, H_X[:,i], 'r-', alpha=0.07, lw=0.5)
+    a13.plot(t_arr, H_O.mean(1), 'b-', lw=2.2, label=f'<H> O  ({fO:.2%})')
+    a13.plot(t_arr, H_X.mean(1), 'r-', lw=2.2, label=f'<H> X  ({fX:.2%})')
+    a13.set(xlabel='t', ylabel='H(t)', title='Hamiltonian H(t) -- Monotone Decrease')
+    a13.legend(fontsize=9)
+    a13.text(0.97, 0.97, 'PASS' if energy_pass else 'FAIL',
+             transform=a13.transAxes, ha='right', va='top', fontsize=13,
+             fontweight='bold', color='green' if energy_pass else 'red')
 
-    ax.plot(t_array, H_O.mean(axis=1), 'b-', lw=2,
-            label=f'O mean H(t)  [mono={pass_energy_O}]')
-    ax.plot(t_array, H_X.mean(axis=1), 'r-', lw=2,
-            label=f'X mean H(t)  [mono={pass_energy_X}]')
+    # [2,1] Phase-space volume
+    a21.fill_between(t_arr[:t_ref_O+1], 0, vol_O[:t_ref_O+1], alpha=0.1, color='blue')
+    a21.fill_between(t_arr[:t_ref_X+1], 0, vol_X[:t_ref_X+1], alpha=0.1, color='red')
+    a21.plot(t_arr, vol_O, 'b-',  lw=2,   label='Empirical O')
+    a21.plot(t_arr, vol_X, 'r-',  lw=2,   label='Empirical X')
+    a21.plot(t_arr, thr_O, 'b--', lw=1.5, alpha=0.7, label='Theory O')
+    a21.plot(t_arr, thr_X, 'r--', lw=1.5, alpha=0.7, label='Theory X')
+    a21.set(xlabel='t', ylabel=r'$V_{phase}(t)/V_{phase}(t_{ref})$',
+            title=r'Phase-Space Volume: $e^{-3\gamma(t-t_{ref})}$')
+    a21.legend(fontsize=8, ncol=2)
+    a21.text(0.05, 0.15, f"R2 O={r2O:.3f}\nR2 X={r2X:.3f}",
+             transform=a21.transAxes, fontsize=9,
+             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+    a21.text(0.97, 0.97, 'PASS' if vol_pass else 'FAIL',
+             transform=a21.transAxes, ha='right', va='top', fontsize=13,
+             fontweight='bold', color='green' if vol_pass else 'red')
 
-    ax.set_xlabel('t'); ax.set_ylabel('H(t)')
-    ax.set_title("Hamiltonian H(t) — Must Be Monotone Decreasing")
-    ax.legend(fontsize=9)
+    # [2,2] Convergence
+    a22.semilogy(t_arr, eps_q_O+1e-6, 'b-',  lw=2,   label=r'$\varepsilon_q$ O')
+    a22.semilogy(t_arr, eps_q_X+1e-6, 'r-',  lw=2,   label=r'$\varepsilon_q$ X')
+    a22.semilogy(t_arr, eps_p_O+1e-6, 'b--', lw=1.5, label=r'$\varepsilon_p$ O')
+    a22.semilogy(t_arr, eps_p_X+1e-6, 'r--', lw=1.5, label=r'$\varepsilon_p$ X')
+    a22.axhline(2.0, color='gray', ls=':',  lw=1, label='eps_q thr')
+    a22.axhline(0.5, color='gray', ls='-.', lw=1, label='eps_p thr')
+    a22.set(xlabel='t', ylabel='Error (log scale)',
+            title=r'Convergence: $\varepsilon_q$ (solid), $\varepsilon_p$ (dashed)')
+    a22.legend(fontsize=8, ncol=2)
+    a22.text(0.97, 0.97, 'PASS' if conv_pass else 'FAIL',
+             transform=a22.transAxes, ha='right', va='top', fontsize=13,
+             fontweight='bold', color='green' if conv_pass else 'red')
 
-    # ── [2,1] Phase-Space Volume ──────────────────────────────────
-    ax = axes[1, 0]
-    ax.plot(t_array, vol_O,      'b-',  lw=2, label=f'O empirical (R²={r2_O:.3f})')
-    ax.plot(t_array, vol_X,      'r-',  lw=2, label=f'X empirical (R²={r2_X:.3f})')
-    ax.plot(t_array, vol_theory, 'k--', lw=2, label='Theory  exp(-3γt)')
-
-    ax.set_xlabel('t'); ax.set_ylabel('V_phase(t) / V_phase(0)')
-    ax.set_title("Phase-Space Volume: Empirical vs Theory exp(-3γt)")
-    ax.legend(fontsize=9)
-    ax.set_ylim(bottom=0)
-
-    # ── [2,2] Convergence Metrics ─────────────────────────────────
-    ax = axes[1, 1]
-    ax.plot(t_array, eps_q_O, 'b-',  lw=2, label='ε_q O  (pos error)')
-    ax.plot(t_array, eps_q_X, 'r-',  lw=2, label='ε_q X  (pos error)')
-    ax.plot(t_array, eps_p_O, 'b--', lw=1.5, label='ε_p O  (mom error)')
-    ax.plot(t_array, eps_p_X, 'r--', lw=1.5, label='ε_p X  (mom error)')
-    ax.axhline(0, color='k', lw=0.7, ls=':')
-
-    ax.set_xlabel('t'); ax.set_ylabel('Error')
-    ax.set_title("Convergence: ε_q(t) and ε_p(t)")
-    ax.legend(fontsize=9)
-
-    # ── [2,3] Classification Result Summary ──────────────────────
-    ax = axes[1, 2]
-    ax.axis('off')
-    bg = 'honeydew' if all_pass else 'mistyrose'
-    ax.set_facecolor(bg)
-    fig.patch.set_facecolor('white')
-
-    def pf(b):
-        return '✓ PASS' if b else '✗ FAIL'
-
-    lines = [
-        "═══  Block I Verification Summary  ═══",
+    # [2,3] Summary
+    bg = '#d4edda' if all_pass else '#fff3cd'
+    a23.set_facecolor(bg); a23.axis('off')
+    a23.set(xlim=(0,1), ylim=(0,1))
+    lns = [
+        "BLOCK I VERIFICATION SUMMARY",
+        "=" * 34,
         "",
-        "── O-image ──",
-        f"  Final CoM:  ({qf_O[0]:.2f}, {qf_O[1]:.2f}, {qf_O[2]:.2f})",
-        f"  dist(q*_O): {dO_O:.3f}   dist(q*_X): {dX_O:.3f}",
-        f"  Prediction: {pred_O}  (true: O)   {pf(pass_cls_O)}",
-        f"  Energy mono:       {pf(pass_energy_O)}",
-        f"  Volume R²={r2_O:.3f}:  {pf(pass_vol_O)}",
-        f"  Conv ε_q={eps_q_O[-1]:.3f}, ε_p={eps_p_O[-1]:.3f}:  {pf(pass_conv_O)}",
+        "O-image Final CoM:",
+        f"  q = ({float(cfO[0]):.3f}, {float(cfO[1]):.3f}, {float(cfO[2]):.3f})",
+        f"  dist(q*_O) = {dOO:.4f}",
+        f"  dist(q*_X) = {dOX:.4f}",
+        f"  pred = {pred_O}  true = O  ({'OK' if pred_O=='O' else 'FAIL'})",
         "",
-        "── X-image ──",
-        f"  Final CoM:  ({qf_X[0]:.2f}, {qf_X[1]:.2f}, {qf_X[2]:.2f})",
-        f"  dist(q*_O): {dO_X:.3f}   dist(q*_X): {dX_X:.3f}",
-        f"  Prediction: {pred_X}  (true: X)   {pf(pass_cls_X)}",
-        f"  Energy mono:       {pf(pass_energy_X)}",
-        f"  Volume R²={r2_X:.3f}:  {pf(pass_vol_X)}",
-        f"  Conv ε_q={eps_q_X[-1]:.3f}, ε_p={eps_p_X[-1]:.3f}:  {pf(pass_conv_X)}",
+        "X-image Final CoM:",
+        f"  q = ({float(cfX[0]):.3f}, {float(cfX[1]):.3f}, {float(cfX[2]):.3f})",
+        f"  dist(q*_O) = {dXO:.4f}",
+        f"  dist(q*_X) = {dXX:.4f}",
+        f"  pred = {pred_X}  true = X  ({'OK' if pred_X=='X' else 'FAIL'})",
         "",
-        "══════════════════════════════════════",
-        f"  OVERALL: {'✓ ALL PASS' if all_pass else '✗ SOME FAILED'}",
+        "Verification:",
+        f"  Energy mono : {'PASS' if energy_pass else 'FAIL'}",
+        f"  Phase vol R2: {'PASS' if vol_pass else 'FAIL'}  O={r2O:.3f} X={r2X:.3f}",
+        f"  Conv eps_q  : {'PASS' if conv_q else 'FAIL'}",
+        f"  Conv eps_p  : {'PASS' if conv_p else 'FAIL'}",
+        f"  Classification: {'PASS' if cls_pass else 'FAIL'}",
+        "",
+        f"  OVERALL: {'ALL PASS' if all_pass else 'PARTIAL (Block II needed)'}",
+        "",
+        f"  gamma={GAMMA}  T={T_FINAL}  dt={DT}  K=4",
+        f"  N_real O={int(mask_O.sum())}  X={int(mask_X.sum())}",
     ]
+    a23.text(0.05, 0.97, "\n".join(lns), transform=a23.transAxes,
+             fontsize=7.8, fontfamily='monospace', va='top')
+    a23.set_title('Block I Verification Summary', fontweight='bold',
+                  color='darkgreen' if all_pass else 'darkorange')
 
-    ax.text(0.05, 0.97, '\n'.join(lines),
-            transform=ax.transAxes,
-            fontsize=9, verticalalignment='top',
-            fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor=bg, alpha=0.9))
-    ax.set_title("Block I Verification Summary")
+    fig.suptitle(
+        "Contact Hamiltonian Fluid NN -- Block I Forward Simulator\n"
+        f"gamma={GAMMA}  T={T_FINAL}  dt={DT}  K=4 RBF  [JAX lax.scan / CUDA]",
+        fontsize=10.5, y=1.01)
 
-    plt.tight_layout()
-    plt.savefig('block1_verification.png', dpi=150, bbox_inches='tight')
-    print("Figure saved: block1_verification.png")
-    plt.show()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"  Figure saved -> {output_path}")
+    plt.close(fig)
+    return all_pass
 
-    return all_pass, {
-        'pass_energy_O': pass_energy_O, 'pass_energy_X': pass_energy_X,
-        'pass_vol_O':    pass_vol_O,    'pass_vol_X':    pass_vol_X,
-        'pass_conv_O':   pass_conv_O,   'pass_conv_X':   pass_conv_X,
-        'pass_cls_O':    pass_cls_O,    'pass_cls_X':    pass_cls_X,
-        'r2_O': r2_O,   'r2_X': r2_X,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════
-
+# ---------------------------------------------------------------------------
+# 10. Main
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    print("\n" + "="*62)
+    print("CONTACT HAMILTONIAN FLUID NN -- BLOCK I (JAX/CUDA)")
+    print("="*62)
 
-    print("=" * 60)
-    print("  Block I: Contact Hamiltonian Fluid Simulator")
-    print("=" * 60)
+    w     = W_INIT
+    mu    = MU_INIT
+    sigma = SIGMA_INIT
+    t_arr = np.linspace(0.0, T_FINAL, N_STEPS+1)
 
-    # RBF parameters
-    w     = W
-    mu    = MU
-    sigma = SIGMA
+    print("\n[1/2] O-image simulation")
+    traj_O, mask_O = simulate(O_IMAGE, w, mu, sigma)
 
-    t_array = np.linspace(0, T_END, N_STEP + 1)  # (201,)
+    print("\n[2/2] X-image simulation")
+    traj_X, mask_X = simulate(X_IMAGE, w, mu, sigma)
 
-    # ── Simulate O-image ──────────────────────────────────────
-    print("\n[1/2] Simulating O-image...")
-    traj_O, mask_O = simulate(O_IMAGE, w, mu, sigma,
-                              gamma=GAMMA, T=T_END, dt=DT)
-    N_real_O = mask_O.sum()
-    print(f"      Real particles: {N_real_O},  Trajectory shape: {traj_O.shape}")
+    passed = verify_and_plot(traj_O, mask_O, traj_X, mask_X,
+                             w, mu, sigma, t_arr,
+                             output_path="block1_verification.png")
 
-    # ── Simulate X-image ──────────────────────────────────────
-    print("[2/2] Simulating X-image...")
-    traj_X, mask_X = simulate(X_IMAGE, w, mu, sigma,
-                              gamma=GAMMA, T=T_END, dt=DT)
-    N_real_X = mask_X.sum()
-    print(f"      Real particles: {N_real_X},  Trajectory shape: {traj_X.shape}")
-
-    # ── Classification ────────────────────────────────────────
-    pred_O, dO_O, dX_O, qf_O = classify(traj_O, mask_O, Q_STAR_O, Q_STAR_X)
-    pred_X, dO_X, dX_X, qf_X = classify(traj_X, mask_X, Q_STAR_O, Q_STAR_X)
-
-    print("\n── Classification Results ──")
-    print(f"  O-image: pred={pred_O}  dist_O={dO_O:.3f}  dist_X={dX_O:.3f}")
-    print(f"  X-image: pred={pred_X}  dist_O={dO_X:.3f}  dist_X={dX_X:.3f}")
-
-    # ── Verify & Plot ─────────────────────────────────────────
-    print("\n── Generating Verification Figure ──")
-    all_pass, results = verify_and_plot(
-        traj_O, mask_O, traj_X, mask_X,
-        w, mu, sigma, t_array
-    )
-
-    # ── Stdout Pass/Fail Report ───────────────────────────────
-    print("\n" + "=" * 60)
-    print("  VERIFICATION PASS/FAIL REPORT")
-    print("=" * 60)
-    checks = [
-        ("Energy monotone (O)",       results['pass_energy_O']),
-        ("Energy monotone (X)",       results['pass_energy_X']),
-        (f"Phase vol R²={results['r2_O']:.3f} ≥ 0.90 (O)", results['pass_vol_O']),
-        (f"Phase vol R²={results['r2_X']:.3f} ≥ 0.90 (X)", results['pass_vol_X']),
-        ("Convergence ε_q<2, ε_p<0.5 (O)", results['pass_conv_O']),
-        ("Convergence ε_q<2, ε_p<0.5 (X)", results['pass_conv_X']),
-        ("Classification O→O",        results['pass_cls_O']),
-        ("Classification X→X",        results['pass_cls_X']),
-    ]
-    for name, passed in checks:
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status}  {name}")
-
-    print("=" * 60)
-    overall = "✓ ALL PASS" if all_pass else "✗ SOME CHECKS FAILED"
-    print(f"  OVERALL RESULT: {overall}")
-    print("=" * 60)
+    print(f"\nFinal: {'PASS' if passed else 'PARTIAL'}")
+    print("Figure: block1_verification.png")
+    print("="*62)
