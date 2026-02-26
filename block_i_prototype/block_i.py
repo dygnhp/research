@@ -103,9 +103,9 @@ W_INIT = jnp.array([
 
 MU_INIT = jnp.array([
     # k=0  O-attractor
-    [ 8.0,  8.0,  0.5],
+    [ 8.0,  8.0,  0.88],
     # k=1  X-attractor
-    [-8.0, -8.0,  0.5],
+    [-8.0, -8.0,  0.12],
     # k=2  Central barrier
     [ 0.0,  0.0,  0.5],
     # k=3..6  O-arc discriminators
@@ -185,44 +185,106 @@ X_IMAGE = np.array([
 # ---------------------------------------------------------------------------
 # 3. Preprocessing
 # ---------------------------------------------------------------------------
-def preprocess(image, tau=TAU, n_max=N_MAX):
+def preprocess(image, tau=TAU, n_max=N_MAX, beta=1.0):
     """
-    Convert 8x8 image to JAX state arrays.
+    Convert 8x8 image to JAX state arrays with contextual 3D Lifting.
+
     Coordinate convention: row r, col c -> x=c, y=7-r (y increases upward)
-    State per particle: [q_x, q_y, q_z(intensity), p_x, p_y, p_z, z_contact]
-    Note: q[2] = pixel intensity (initial z-position lift)
-          S[6]  = contact variable z_i(t) (dissipated energy), starts at 0
+    State per particle: [q_x, q_y, q_z, p_x, p_y, p_z, z_contact]
+
+    3D Lifting (modified):
+        z_i(0) = sigmoid(beta * (d_axis - |d_diag|))
+
+        d_axis  = # of ON pixels among 4-connected neighbors (up/down/left/right)
+                  → high for O-arc pixels (axially connected)
+        d_diag  = signed diagonal neighbor asymmetry
+                  |d_diag| = |NW+SE - NE+SW|
+                  → high for X-diagonal pixels (diagonally connected)
+
+        Result:
+            O-arc pixel   : d_axis=2, |d_diag|=0 → z ≈ 0.88  (beta=1)
+            X-diag pixel  : d_axis=0, |d_diag|=2 → z ≈ 0.12  (beta=1)
+            → q_CoM_z^O ≈ 0.88,  q_CoM_z^X ≈ 0.12  (z-CoM separated)
+
+    Note: q[2] = contextual z (encodes local geometry, NOT raw intensity)
+          S[6] = z_contact (contact geometry variable, dissipated energy)
+          These are INDEPENDENT variables. No physics equations modified.
+
+    dH/dt = -gamma * ||p||^2 <= 0 holds regardless of q[2] initial value.
     """
     rows, cols = image.shape
+
+    # ── Local geometry encoder ──────────────────────────────────────────────
+    def safe_pixel(r, c):
+        """Returns pixel value with zero-padding outside image boundary."""
+        if 0 <= r < rows and 0 <= c < cols:
+            return float(image[r, c])
+        return 0.0
+
+    def compute_z_init(r, c, b):
+        """
+        Compute contextual z for pixel (r, c).
+        d_axis  : sum of 4-connected ON neighbors
+        d_diag  : signed diagonal asymmetry (NW+SE) - (NE+SW)
+        z = sigmoid(b * (d_axis - |d_diag|))
+        """
+        d_axis = (safe_pixel(r-1, c) +   # up
+                  safe_pixel(r+1, c) +   # down
+                  safe_pixel(r, c-1) +   # left
+                  safe_pixel(r, c+1))    # right
+
+        d_diag_signed = (safe_pixel(r-1, c-1) +   # NW
+                         safe_pixel(r+1, c+1) -   # SE
+                         safe_pixel(r-1, c+1) -   # NE
+                         safe_pixel(r+1, c-1))    # SW
+        d_diag = abs(d_diag_signed)
+
+        score = d_axis - d_diag
+        return 1.0 / (1.0 + np.exp(-b * score))   # sigmoid
+
+    # ── Particle extraction ─────────────────────────────────────────────────
     q_list = []
     for r in range(rows):
         for c in range(cols):
             if image[r, c] > tau:
-                q_list.append([float(c), float(rows-1-r), float(image[r,c])])
+                x = float(c)
+                y = float(rows - 1 - r)          # y increases upward
+                z = compute_z_init(r, c, beta)    # contextual z
+                q_list.append([x, y, z])
 
     n_real = len(q_list)
     assert n_real > 0, "No real particles -- check tau"
-    assert n_real <= n_max
+    assert n_real <= n_max, f"Too many particles: {n_real} > {n_max}"
 
+    # ── Padding to fixed size n_max ─────────────────────────────────────────
     q0_np   = np.zeros((n_max, 3), dtype=np.float32)
-    p0_np   = np.zeros((n_max, 3), dtype=np.float32)
-    z0_np   = np.zeros((n_max,),   dtype=np.float32)
+    p0_np   = np.zeros((n_max, 3), dtype=np.float32)   # p_i(0) = 0
+    z0_np   = np.zeros((n_max,),   dtype=np.float32)   # z_contact(0) = 0
     mask_np = np.zeros((n_max,),   dtype=bool)
 
     for i, pos in enumerate(q_list):
-        q0_np[i] = pos
+        q0_np[i]   = pos
         mask_np[i] = True
+    # dummy particles remain at (0,0,0) with mask=False
 
     q0   = jnp.array(q0_np)
     p0   = jnp.array(p0_np)
     z0   = jnp.array(z0_np)
     mask = jnp.array(mask_np)
+
     assert q0.shape == (n_max, 3)
     assert p0.shape == (n_max, 3)
     assert int(mask.sum()) > 0
 
+    # ── Diagnostic print ────────────────────────────────────────────────────
+    z_real = q0_np[mask_np, 2]
     print(f"  Preprocessed: {n_real} real / {n_max} total")
+    print(f"  z_init  mean={z_real.mean():.4f}  "
+          f"min={z_real.min():.4f}  max={z_real.max():.4f}  "
+          f"(beta={beta})")
+
     return q0, p0, z0, mask
+
 
 # ---------------------------------------------------------------------------
 # 4. RBF Potential and Gradient
@@ -231,25 +293,31 @@ def preprocess(image, tau=TAU, n_max=N_MAX):
 def rbf_potential(q, w, mu, sigma):
     """
     V(q_i) = sum_k w_k * exp(-||q_i - mu_k||^2 / (2*sigma_k^2))
-    q:(N,3) w:(K,) mu:(K,3) sigma:(K,) -> V:(N,)
+    q:(N,3)  w:(K,)  mu:(K,3)  sigma:(K,)  ->  V:(N,)
     """
-    diff    = q[:, None, :] - mu[None, :, :]           # (N, K, 3)
-    sq_dist = jnp.sum(diff**2, axis=-1)                 # (N, K)
-    gauss   = jnp.exp(-sq_dist / (2.0 * sigma**2))     # (N, K)
-    return jnp.sum(w * gauss, axis=-1)                  # (N,)
+    diff    = q[:, None, :] - mu[None, :, :]        # (N, K, 3)
+    sq_dist = jnp.sum(diff ** 2, axis=-1)            # (N, K)
+    gauss   = jnp.exp(-sq_dist / (2.0 * sigma ** 2)) # (N, K)
+    return jnp.sum(w * gauss, axis=-1)               # (N,)
 
 
 @jit
 def rbf_gradient(q, w, mu, sigma):
     """
     grad_{q_i} V = sum_k w_k * exp(...) * (-(q_i - mu_k) / sigma_k^2)
-    q:(N,3) -> grad:(N,3)
+    q:(N,3)  ->  grad:(N,3)
     """
     diff    = q[:, None, :] - mu[None, :, :]
-    sq_dist = jnp.sum(diff**2, axis=-1)
-    gauss   = jnp.exp(-sq_dist / (2.0 * sigma**2))
-    factor  = w * gauss / (sigma**2)                   # (N, K)
+    sq_dist = jnp.sum(diff ** 2, axis=-1)
+    gauss   = jnp.exp(-sq_dist / (2.0 * sigma ** 2))
+    factor  = w * gauss / (sigma ** 2)               # (N, K)
     return jnp.sum(-factor[:, :, None] * diff, axis=1) # (N, 3)
+
+
+# 모듈 수준에서 명시적 참조 고정 -- PyCharm unresolved reference 해소
+_rbf_potential = rbf_potential
+_rbf_gradient  = rbf_gradient
+
 
 # ---------------------------------------------------------------------------
 # 5. Contact Hamiltonian RHS
@@ -260,26 +328,21 @@ def contact_rhs(S, w, mu, sigma, gamma):
     Contact Hamilton's equations:
         dq/dt = p
         dp/dt = -grad_q V(q) - gamma * p
-        dz/dt = ||p||^2 - H_i    where H_i = ||p||^2/2 + V(q)
+        dz/dt = ||p||^2 - H_i    (H_i = ||p||^2/2 + V(q))
 
-    Physical interpretation:
-        dH_i/dt = -gamma * ||p_i||^2 <= 0  (energy monotone decrease)
-        div(X_contact) = -gamma per DoF  --> V_phase ~ exp(-3*gamma*t)
-        This intentionally BREAKS Liouville's theorem (Contact geometry).
-
-    S:(N_max, 7)  gamma: Python float
-    S layout: [:, 0:3]=q  [:, 3:6]=p  [:, 6]=z_contact
+    dH_i/dt = -gamma * ||p_i||^2 <= 0  (energy monotone decrease)
+    div(X_contact) = -gamma per DoF  -->  V_phase ~ exp(-3*gamma*t)
     """
-    q      = S[:, :3]
-    p      = S[:, 3:6]
-    V      = rbf_potential(q, w, mu, sigma)          # (N,)
-    gV     = rbf_gradient(q, w, mu, sigma)           # (N, 3)
-    p_sq   = jnp.sum(p**2, axis=-1)                 # (N,)
-    H_i    = p_sq / 2.0 + V                          # (N,)
+    q    = S[:, :3]
+    p    = S[:, 3:6]
+    V    = _rbf_potential(q, w, mu, sigma)   # 명시적 참조 사용
+    gV   = _rbf_gradient(q, w, mu, sigma)    # 명시적 참조 사용
+    p_sq = jnp.sum(p ** 2, axis=-1)
+    H_i  = p_sq / 2.0 + V
 
-    dq_dt  = p
-    dp_dt  = -gV - gamma * p
-    dz_dt  = p_sq - H_i
+    dq_dt = p
+    dp_dt = -gV - gamma * p
+    dz_dt = p_sq - H_i
 
     return jnp.concatenate([dq_dt, dp_dt, dz_dt[:, None]], axis=-1)
 
