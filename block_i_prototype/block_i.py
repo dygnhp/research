@@ -10,12 +10,16 @@ Target HW: Windows 11 + NVIDIA GPU (RTX 4060) + Intel CPU via WSL2
 Install (WSL2 with CUDA 12):
     pip install --upgrade "jax[cuda12]" matplotlib scipy
 
-NOTE on physics parameters:
-  The K=4 fixed parameters have limited convergence because both O- and X-
-  image particles start in [0,7]^2, while the X-attractor is at (-8,-8) --
-  distance ~16, far outside the Gaussian support (3*sigma=6).
-  This is intentional: Block I tests the INFRASTRUCTURE (RK4, energy
-  decrease, contact geometry). Block II will LEARN optimal parameters.
+NOTE on physics parameters (K=16):
+  K=16 structured initialization addresses the core failure of K=4:
+  Both O and X images share the same global CoM ≈ (3.5, 3.5), so a
+  global attractor cannot distinguish them. Discrimination requires
+  per-quadrant sensitivity to intra-quadrant pixel distribution:
+    O-image: arc pixels at quadrant corners → compact covariance
+    X-image: diagonal pixels across quadrant → elongated covariance
+  k=3..6  (O-discriminators): attract O arc pixels, widening O-X gap
+  k=7..10 (X-discriminators): repel O arc pixels from X-diagonal regions
+  k=13..15 (reserve): free parameters for Block II to reshape.
 
 NOTE on phase-volume computation:
   At t=0, all p_i=0 -> p-subspace has zero variance -> 6D covariance is
@@ -58,12 +62,100 @@ TAU      = 0.5
 Q_STAR_O = jnp.array([ 8.0,  8.0, 0.0])
 Q_STAR_X = jnp.array([-8.0, -8.0, 0.0])
 
-W_INIT     = jnp.array([-2.0, -2.0,  1.5, -0.5])
-MU_INIT    = jnp.array([[ 8.0,  8.0, 0.5],
-                          [-8.0, -8.0, 0.5],
-                          [ 0.0,  0.0, 0.5],
-                          [ 4.0,  4.0, 0.5]], dtype=jnp.float32)
-SIGMA_INIT = jnp.array([2.0, 2.0, 2.0, 3.0])
+# ── K=16 structured initialization ─────────────────────────────────────
+# Role assignment:
+#   k=0      : O-class attractor  (deep well at O target)
+#   k=1      : X-class attractor  (deep well at X target)
+#   k=2      : Central barrier    (repulsor separating two classes)
+#   k=3..6   : O-class discriminator RBFs, one per quadrant
+#              Placed at O arc pixel centroids — attract O particles
+#   k=7..10  : X-class discriminator RBFs, one per quadrant
+#              Placed at X diagonal pixel centroids — repel O, attract X
+#   k=11     : O-class path guide (pulls O particles toward O attractor)
+#   k=12     : X-class path guide (pulls X particles toward X attractor)
+#   k=13..15 : Reserve RBFs (wide sigma, small w — let Block II reshape these)
+# ────────────────────────────────────────────────────────────────────────
+
+W_INIT = jnp.array([
+    # Attractors
+    -2.0,   # k=0  O-attractor
+    -2.0,   # k=1  X-attractor
+    # Barrier
+    +2.5,   # k=2  central barrier (strengthened from +1.5)
+    # O-class discriminators (attract O-arc pixels)
+    -1.0,   # k=3  Q1 O-arc  (upper-left quadrant)
+    -1.0,   # k=4  Q2 O-arc  (upper-right quadrant)
+    -1.0,   # k=5  Q3 O-arc  (lower-left quadrant)
+    -1.0,   # k=6  Q4 O-arc  (lower-right quadrant)
+    # X-class discriminators (repel O, attract X diagonal pixels)
+    +1.2,   # k=7  Q1 X-diag repulsor
+    +1.2,   # k=8  Q2 X-diag repulsor
+    +1.2,   # k=9  Q3 X-diag repulsor
+    +1.2,   # k=10 Q4 X-diag repulsor
+    # Path guides
+    -0.6,   # k=11 O path guide
+    -0.6,   # k=12 X path guide
+    # Reserve (small weight, wide spread)
+    -0.3,   # k=13
+    -0.3,   # k=14
+    -0.3,   # k=15
+])
+
+MU_INIT = jnp.array([
+    # k=0  O-attractor
+    [ 8.0,  8.0,  0.5],
+    # k=1  X-attractor
+    [-8.0, -8.0,  0.5],
+    # k=2  Central barrier
+    [ 0.0,  0.0,  0.5],
+    # k=3..6  O-arc discriminators
+    # Placed at centroid of O arc pixels in each quadrant
+    # Q1(col 0-3, row 4-7): O arc at (2,6),(3,6),(1,5),(1,4) -> centroid~=(1.75,5.25)
+    [ 1.75,  5.25,  0.5],   # k=3  Q1
+    # Q2(col 4-7, row 4-7): O arc at (4,6),(5,6),(6,5),(6,4) -> centroid~=(5.25,5.25)
+    [ 5.25,  5.25,  0.5],   # k=4  Q2
+    # Q3(col 0-3, row 0-3): O arc at (1,2),(1,3),(2,1),(3,1) -> centroid~=(1.75,1.75)
+    [ 1.75,  1.75,  0.5],   # k=5  Q3
+    # Q4(col 4-7, row 0-3): O arc at (6,3),(6,2),(5,1),(4,1) -> centroid~=(5.25,1.75)
+    [ 5.25,  1.75,  0.5],   # k=6  Q4
+    # k=7..10  X-diagonal repulsors
+    # Placed at centroid of X diagonal pixels in each quadrant
+    # Q1 X-diag: (0,7),(1,6),(2,5),(3,4) -> centroid=(1.5,5.5)
+    [ 1.5,   5.5,   0.5],   # k=7  Q1
+    # Q2 X-diag: (7,7),(6,6),(5,5),(4,4) -> centroid=(5.5,5.5)
+    [ 5.5,   5.5,   0.5],   # k=8  Q2
+    # Q3 X-diag: (3,3),(2,2),(1,1),(0,0) -> centroid=(1.5,1.5)
+    [ 1.5,   1.5,   0.5],   # k=9  Q3
+    # Q4 X-diag: (4,3),(5,2),(6,1),(7,0) -> centroid=(5.5,1.5)
+    [ 5.5,   1.5,   0.5],   # k=10 Q4
+    # k=11  O path guide: midpoint O-start->O-attractor
+    [ 5.0,   5.0,   0.5],   # k=11
+    # k=12  X path guide: midpoint X-start->X-attractor (note: start~=(3.5,3.5))
+    [-2.0,  -2.0,   0.5],   # k=12
+    # k=13..15  Reserve RBFs (evenly spread, large sigma)
+    [ 0.0,   6.0,   0.5],   # k=13
+    [ 6.0,   0.0,   0.5],   # k=14
+    [-4.0,   4.0,   0.5],   # k=15
+], dtype=jnp.float32)
+
+SIGMA_INIT = jnp.array([
+    2.0,   # k=0  O-attractor
+    2.0,   # k=1  X-attractor
+    2.5,   # k=2  barrier (slightly wider)
+    1.5,   # k=3  Q1 O-discriminator (narrow: must be precise)
+    1.5,   # k=4  Q2 O-discriminator
+    1.5,   # k=5  Q3 O-discriminator
+    1.5,   # k=6  Q4 O-discriminator
+    1.5,   # k=7  Q1 X-discriminator (narrow: must be precise)
+    1.5,   # k=8  Q2 X-discriminator
+    1.5,   # k=9  Q3 X-discriminator
+    1.5,   # k=10 Q4 X-discriminator
+    2.5,   # k=11 O path guide
+    2.5,   # k=12 X path guide
+    4.0,   # k=13 reserve (wide)
+    4.0,   # k=14 reserve (wide)
+    4.0,   # k=15 reserve (wide)
+])
 
 # ---------------------------------------------------------------------------
 # 2. Test images
@@ -385,10 +477,15 @@ def verify_and_plot(traj_O, mask_O, traj_X, mask_X,
     print(f"{S}")
     print(f"  OVERALL: {'*** ALL PASS ***' if all_pass else '--- PARTIAL (see notes) ---'}")
     if not cls_pass:
-        print("\n  NOTE: Classification FAIL is expected for fixed K=4 params.")
-        print("  X-attractor at (-8,-8) is distance ~16 from initial particles.")
-        print("  Gaussian support = 3*sigma = 6 -> force ~exp(-16^2/8) ~ 0.")
-        print("  Block II will learn attractor positions via adjoint gradient descent.")
+        print("\n  NOTE: Classification FAIL persists with K=16 structured init.")
+        print("  Diagnostic — final CoM positions:")
+        print(f"    O-image CoM: ({float(cfO[0]):.4f}, {float(cfO[1]):.4f}, {float(cfO[2]):.4f})")
+        print(f"    X-image CoM: ({float(cfX[0]):.4f}, {float(cfX[1]):.4f}, {float(cfX[2]):.4f})")
+        print(f"    O: dist(q*_O)={dOO:.4f}  dist(q*_X)={dOX:.4f}")
+        print(f"    X: dist(q*_O)={dXO:.4f}  dist(q*_X)={dXX:.4f}")
+        print("  Root cause: X-attractor at (-8,-8) is ~16 units from init particles.")
+        print("  Gaussian support 3*sigma=6 -> force ~ exp(-16^2/8) ~ 0.")
+        print("  Block II adjoint gradient descent will relocate mu_k to resolve this.")
     print(S)
 
     # --- Figure ---
@@ -410,12 +507,26 @@ def verify_and_plot(traj_O, mask_O, traj_X, mask_X,
     cf  = a11.contourf(gx, gy, Vg, levels=40, cmap='RdYlBu_r', alpha=0.85)
     a11.contour(gx, gy, Vg, levels=20, colors='k', linewidths=0.3, alpha=0.4)
     plt.colorbar(cf, ax=a11, shrink=0.85, label='V(q)')
-    for k, (col, mrk, sz, lab) in enumerate([
-            ('blue', '*', 220, 'O-attractor'),
-            ('red',  '*', 220, 'X-attractor'),
-            ('darkorange', '^', 160, 'Barrier'),
-            ('green', 'D', 110, 'Path guide')]):
+    # Plot special markers for named RBFs only (avoid legend clutter)
+    special = [
+        (0,  'blue',       '*', 220, 'O-attractor'),
+        (1,  'red',        '*', 220, 'X-attractor'),
+        (2,  'darkorange', '^', 160, 'Barrier'),
+        (11, 'green',      'D', 110, 'O path guide'),
+        (12, 'purple',     'D', 110, 'X path guide'),
+    ]
+    for k, col, mrk, sz, lab in special:
         a11.scatter(*mu_np[k, :2], s=sz, c=col, marker=mrk, zorder=6, label=lab)
+    # Plot discriminator RBFs as small dots grouped by class
+    for k in range(3, 7):
+        a11.scatter(*mu_np[k, :2], s=55, c='cyan', marker='o',
+                    zorder=5, label='O-discrim' if k==3 else '')
+    for k in range(7, 11):
+        a11.scatter(*mu_np[k, :2], s=55, c='orange', marker='s',
+                    zorder=5, label='X-discrim' if k==7 else '')
+    # Reserve RBFs: tiny grey dots, no label
+    for k in range(13, 16):
+        a11.scatter(*mu_np[k, :2], s=25, c='grey', marker='.', zorder=4, alpha=0.5)
     q0O = np.array(traj_O[0, mO, :2])
     q0X = np.array(traj_X[0, mX, :2])
     a11.scatter(q0O[:,0], q0O[:,1], s=18, c='blue', alpha=0.7, label='O init')
@@ -516,7 +627,7 @@ def verify_and_plot(traj_O, mask_O, traj_X, mask_X,
         "",
         f"  OVERALL: {'ALL PASS' if all_pass else 'PARTIAL (Block II needed)'}",
         "",
-        f"  gamma={GAMMA}  T={T_FINAL}  dt={DT}  K=4",
+        f"  gamma={GAMMA}  T={T_FINAL}  dt={DT}  K=16",
         f"  N_real O={int(mask_O.sum())}  X={int(mask_X.sum())}",
     ]
     a23.text(0.05, 0.97, "\n".join(lns), transform=a23.transAxes,
@@ -526,7 +637,7 @@ def verify_and_plot(traj_O, mask_O, traj_X, mask_X,
 
     fig.suptitle(
         "Contact Hamiltonian Fluid NN -- Block I Forward Simulator\n"
-        f"gamma={GAMMA}  T={T_FINAL}  dt={DT}  K=4 RBF  [JAX lax.scan / CUDA]",
+        f"gamma={GAMMA}  T={T_FINAL}  dt={DT}  K=16 RBF  [JAX lax.scan / CUDA]",
         fontsize=10.5, y=1.01)
 
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
