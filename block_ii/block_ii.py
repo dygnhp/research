@@ -7,6 +7,8 @@ Goal:      Optimize theta = {w_k, mu_k, sigma_k} (k=2..15, frozen k=0,1)
            so that the final CoM of particle ensembles converges to:
                O-image CoM  -->  q*_O = ( 8,  8, 0)
                X-image CoM  -->  q*_X = (-8, -8, 0)
+Data:      Dataset-driven -- each epoch trains on a randomly sampled
+           O/X variant from data_generator.py; validation on canonical images.
 
 Gradient:  Full BPTT through jax.lax.scan  +  jax.checkpoint (memory)
 Optimizer: optax Adam  +  warmup-cosine-decay schedule  +  grad clipping
@@ -47,6 +49,7 @@ Key design decisions:
 
 from pathlib import Path
 import os
+import sys
 
 # JAX memory control -- must be set before importing jax
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -65,8 +68,10 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import time
 
-# Output directory: same folder as this script
+# Import shared data generator (project root)
 _HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
+from data_generator import generate_dataset, O_CANONICAL, X_CANONICAL
 
 print("=" * 62)
 print("JAX version    :", jax.__version__)
@@ -97,29 +102,10 @@ CONV_P_THR = 0.5
 
 
 # ===========================================================================
-# SECTION 2: Test images  (identical to block_i.py)
+# SECTION 2: Test images  (canonical O/X from data_generator)
 # ===========================================================================
-O_IMAGE = np.array([
-    [0,0,0,0,0,0,0,0],
-    [0,0,1,1,1,1,0,0],
-    [0,1,0,0,0,0,1,0],
-    [0,1,0,0,0,0,1,0],
-    [0,1,0,0,0,0,1,0],
-    [0,1,0,0,0,0,1,0],
-    [0,0,1,1,1,1,0,0],
-    [0,0,0,0,0,0,0,0],
-], dtype=float)
-
-X_IMAGE = np.array([
-    [1,0,0,0,0,0,0,1],
-    [0,1,0,0,0,0,1,0],
-    [0,0,1,0,0,1,0,0],
-    [0,0,0,1,1,0,0,0],
-    [0,0,0,1,1,0,0,0],
-    [0,0,1,0,0,1,0,0],
-    [0,1,0,0,0,0,1,0],
-    [1,0,0,0,0,0,0,1],
-], dtype=float)
+O_IMAGE = O_CANONICAL
+X_IMAGE = X_CANONICAL
 
 
 # ===========================================================================
@@ -191,12 +177,47 @@ _, _, _, MASK_O = preprocess(O_IMAGE)
 _, _, _, MASK_X = preprocess(X_IMAGE)
 
 def _make_S0(image):
-    """Build initial state tensor S0 (N_MAX, 7) for a given image."""
-    q0, p0, z0, _ = preprocess(image)
-    return jnp.concatenate([q0, p0, z0[:, None]], axis=-1)
+    """Build initial state tensor S0 (N_MAX, 7) and mask for a given image."""
+    q0, p0, z0, mask = preprocess(image)
+    S0 = jnp.concatenate([q0, p0, z0[:, None]], axis=-1)
+    return S0, mask
 
-S0_O = _make_S0(O_IMAGE)   # (N_MAX, 7) -- device constant
-S0_X = _make_S0(X_IMAGE)   # (N_MAX, 7) -- device constant
+# Canonical validation data (always available for logging/figures)
+S0_O, _ = _make_S0(O_IMAGE)   # (N_MAX, 7) -- device constant
+S0_X, _ = _make_S0(X_IMAGE)   # (N_MAX, 7) -- device constant
+
+
+# ===========================================================================
+# SECTION 3b: Dataset Preparation  (variant O/X images for training)
+# ===========================================================================
+N_TRAIN_PER_CLASS = 50
+DATASET_SEED      = 42
+
+def prepare_training_data(n_per_class=N_TRAIN_PER_CLASS, seed=DATASET_SEED):
+    """
+    Generate and preprocess a dataset of variant O/X images.
+    Returns JAX arrays ready for training:
+        train_S0_O  : (N, N_MAX, 7)  initial states for O variants
+        train_mask_O: (N, N_MAX)     masks for O variants
+        train_S0_X  : (N, N_MAX, 7)  initial states for X variants
+        train_mask_X: (N, N_MAX)     masks for X variants
+    """
+    ds = generate_dataset(n_per_class, seed)
+
+    S0_list_O, mask_list_O = [], []
+    for img in ds['O_images']:
+        s0, mask = _make_S0(img)
+        S0_list_O.append(s0)
+        mask_list_O.append(mask)
+
+    S0_list_X, mask_list_X = [], []
+    for img in ds['X_images']:
+        s0, mask = _make_S0(img)
+        S0_list_X.append(s0)
+        mask_list_X.append(mask)
+
+    return (jnp.stack(S0_list_O),   jnp.stack(mask_list_O),
+            jnp.stack(S0_list_X),   jnp.stack(mask_list_X))
 
 
 # ===========================================================================
@@ -391,10 +412,10 @@ MU_FROZEN    = jnp.array([[ 8.0,  8.0,  0.88],
 SIGMA_FROZEN = jnp.array([2.0, 2.0])
 
 # Stepping stones (k=2, k=3)
-_w_stones   = np.array([-0.5, -0.5], dtype=np.float32)
-_mu_stones  = np.array([[ 6.0,  6.0, 0.5],
-                         [-2.0, -2.0, 0.5]], dtype=np.float32)
-_sig_stones = np.array([2.0, 2.0], dtype=np.float32)
+_w_stones   = np.array([-1.0, -1.0], dtype=np.float32)
+_mu_stones  = np.array([[ 6.0,  6.0, 0.88],
+                         [ 0.0,  0.0, 0.12]], dtype=np.float32)
+_sig_stones = np.array([3.0, 3.0], dtype=np.float32)
 
 # Free RBFs: 4x3 grid  (x in {0.5, 2.5, 4.5, 6.5}, y in {6.0, 3.5, 1.0})
 _free_mu = np.array([
@@ -450,14 +471,13 @@ def full_params(params):
 # ===========================================================================
 # SECTION 11: Loss Function
 # ===========================================================================
-def loss_fn(params):
+def loss_fn(params, s0_O, mask_O, s0_X, mask_X):
     """
     L(theta) = ||CoM_O(T) - q*_O||^2  +  ||CoM_X(T) - q*_X||^2
              + lambda_p * (mean_i ||p_i^O(T)||^2 + mean_i ||p_i^X(T)||^2)
 
-    The position term drives CoM to the correct attractor.
-    The momentum penalty encourages the ensemble to come to rest at T,
-    making the classification boundary sharper and more stable.
+    Now accepts per-call S0/mask so each epoch can use a different image
+    variant from the training dataset.
 
     Gradient flows via automatic differentiation through lax.scan.
     Returns: (total_loss, (loss_q, loss_p, com_O_T, com_X_T, traj_O, traj_X))
@@ -465,20 +485,20 @@ def loss_fn(params):
     w, mu, sigma = full_params(params)
 
     # O-image forward pass
-    traj_O  = simulate_diff(S0_O, w, mu, sigma)
-    com_O_T = com_single(traj_O[-1, :, :3], MASK_O)
+    traj_O  = simulate_diff(s0_O, w, mu, sigma)
+    com_O_T = com_single(traj_O[-1, :, :3], mask_O)
 
     # X-image forward pass
-    traj_X  = simulate_diff(S0_X, w, mu, sigma)
-    com_X_T = com_single(traj_X[-1, :, :3], MASK_X)
+    traj_X  = simulate_diff(s0_X, w, mu, sigma)
+    com_X_T = com_single(traj_X[-1, :, :3], mask_X)
 
     # Position loss: squared L2 distance from final CoM to target attractor
     loss_q = (jnp.sum((com_O_T - Q_STAR_O) ** 2) +
               jnp.sum((com_X_T - Q_STAR_X) ** 2))
 
     # Momentum penalty: mean squared momentum at T (encourages rest)
-    mO      = MASK_O.astype(jnp.float32)
-    mX      = MASK_X.astype(jnp.float32)
+    mO      = mask_O.astype(jnp.float32)
+    mX      = mask_X.astype(jnp.float32)
     p_O_T   = traj_O[-1, :, 3:6]
     p_X_T   = traj_X[-1, :, 3:6]
     pnorm_O = jnp.sum(jnp.sum(p_O_T ** 2, axis=-1) * mO) / jnp.sum(mO)
@@ -492,11 +512,11 @@ def loss_fn(params):
 # ===========================================================================
 # SECTION 12: Optimizer Setup
 # ===========================================================================
-N_EPOCHS     = 1000
-LOG_EVERY    = 10
-SAVE_EVERY   = 100
-WARMUP_STEPS = 50
-PEAK_LR      = 1e-3
+N_EPOCHS     = 3000
+LOG_EVERY    = 20
+SAVE_EVERY   = 500
+WARMUP_STEPS = 100
+PEAK_LR      = 5e-3
 END_LR       = 1e-5
 
 schedule = optax.warmup_cosine_decay_schedule(
@@ -514,18 +534,19 @@ optimizer = optax.chain(
 
 
 @jit
-def train_step(params, opt_state):
+def train_step(params, opt_state, s0_O, mask_O, s0_X, mask_X):
     """
     Single JIT-compiled training step:
-      1. Forward pass + loss (loss_fn)
+      1. Forward pass + loss on the given image pair
       2. Backward pass (auto-diff BPTT through lax.scan)
       3. Optimizer update (Adam + warmup-cosine LR + gradient clipping)
       4. Parameter update via optax.apply_updates
 
-    Note: optax.chain requires params as third argument to optimizer.update
-    for scale_by_adam (needed for AdaGrad-style second-moment correction).
+    s0_O, mask_O, s0_X, mask_X are regular JAX array arguments so the
+    compiled kernel works for any image pair with shape (N_MAX, 7)/(N_MAX,).
     """
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        params, s0_O, mask_O, s0_X, mask_X)
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
     return new_params, new_opt_state, loss, aux
@@ -760,13 +781,15 @@ def make_verification_figure(history, params_final,
 # ===========================================================================
 def run_training():
     """
-    Main training loop.
+    Dataset-driven training loop.
 
     Per-epoch:
+        * Sample a random O/X variant from the pre-generated dataset
         * JIT-compiled forward + BPTT backward via train_step
         * Adam update with warmup-cosine LR schedule
 
     Every LOG_EVERY epochs:
+        * Validate on CANONICAL O/X (not the training variant)
         * Log: loss, CoM positions, classification, eps_q
         * Early stopping check: correct class + eps_q < CONV_Q_THR
 
@@ -775,6 +798,13 @@ def run_training():
 
     Returns: (trained_params, history, all_pass)
     """
+    # ── Prepare training dataset ──────────────────────────────────────────
+    print("\n[Dataset] Generating training data...")
+    train_S0_O, train_mask_O, train_S0_X, train_mask_X = \
+        prepare_training_data(N_TRAIN_PER_CLASS, DATASET_SEED)
+    n_train = train_S0_O.shape[0]
+    print(f"  {n_train} O variants + {n_train} X variants ready")
+
     print("\n" + "=" * 62)
     print("CONTACT HAMILTONIAN FLUID NN -- BLOCK II (JAX/CUDA)")
     print("=" * 62)
@@ -785,10 +815,12 @@ def run_training():
     print(f"  Frozen:    k=0 (O-attractor), k=1 (X-attractor)")
     print(f"  Learnable: k=2..15  (14 RBFs: 2 stepping stones + 12 free)")
     print(f"  Gradient:  full BPTT through lax.scan + jax.checkpoint")
+    print(f"  Dataset:   {n_train} variants/class (seed={DATASET_SEED})")
     print("=" * 62 + "\n")
 
     params    = params_init
     opt_state = optimizer.init(params)
+    rng       = np.random.RandomState(123)
 
     history = {
         'epoch'      : [],
@@ -806,14 +838,29 @@ def run_training():
 
     for epoch in range(N_EPOCHS):
         t0 = time.time()
-        params, opt_state, loss_val, aux = train_step(params, opt_state)
+
+        # Sample a random training pair each epoch
+        idx_O = rng.randint(n_train)
+        idx_X = rng.randint(n_train)
+
+        params, opt_state, loss_val, aux = train_step(
+            params, opt_state,
+            train_S0_O[idx_O], train_mask_O[idx_O],
+            train_S0_X[idx_X], train_mask_X[idx_X])
         loss_q_val, loss_p_val, com_O_T, com_X_T, traj_O, traj_X = aux
 
         if epoch % LOG_EVERY == 0:
-            pred_O_s, dOO, _, _   = classify_traj(traj_O, MASK_O)
-            pred_X_s, _,   dXX, _ = classify_traj(traj_X, MASK_X)
-            com_O_np = np.array(com_O_T)
-            com_X_np = np.array(com_X_T)
+            # Validate on CANONICAL images (not the training variant)
+            w_val, mu_val, sig_val = full_params(params)
+            traj_O_val = simulate_diff(S0_O, w_val, mu_val, sig_val)
+            traj_X_val = simulate_diff(S0_X, w_val, mu_val, sig_val)
+
+            pred_O_s, dOO, _, _   = classify_traj(traj_O_val, MASK_O)
+            pred_X_s, _,   dXX, _ = classify_traj(traj_X_val, MASK_X)
+            com_O_val = com_single(traj_O_val[-1, :, :3], MASK_O)
+            com_X_val = com_single(traj_X_val[-1, :, :3], MASK_X)
+            com_O_np = np.array(com_O_val)
+            com_X_np = np.array(com_X_val)
             eps_q_O  = float(np.linalg.norm(com_O_np - np.array(Q_STAR_O)))
             eps_q_X  = float(np.linalg.norm(com_X_np - np.array(Q_STAR_X)))
 
@@ -830,13 +877,13 @@ def run_training():
             print(f"Ep {epoch:4d} | "
                   f"L={float(loss_val):.5f} "
                   f"(q={float(loss_q_val):.4f} p={float(loss_p_val):.4f}) | "
-                  f"CoM_O=({com_O_np[0]:.2f},{com_O_np[1]:.2f}) "
+                  f"val CoM_O=({com_O_np[0]:.2f},{com_O_np[1]:.2f}) "
                   f"CoM_X=({com_X_np[0]:.2f},{com_X_np[1]:.2f}) | "
                   f"pred={pred_O_s},{pred_X_s} | "
                   f"eq=({eps_q_O:.3f},{eps_q_X:.3f}) | "
                   f"{elapsed:.2f}s")
 
-            # Early stopping: correct classification + convergence
+            # Early stopping: correct classification + convergence on canonical
             if epoch > 0:
                 if (pred_O_s == 'O' and pred_X_s == 'X'
                         and eps_q_O < CONV_Q_THR and eps_q_X < CONV_Q_THR):
@@ -952,7 +999,8 @@ if __name__ == "__main__":
     print("\n[JIT warmup] Compiling train_step (first run: 30-120s on RTX 4060)...")
     opt_state_warmup = optimizer.init(params_init)
     t_c = time.time()
-    _p, _o, _l, _a = train_step(params_init, opt_state_warmup)
+    _p, _o, _l, _a = train_step(
+        params_init, opt_state_warmup, S0_O, MASK_O, S0_X, MASK_X)
     _l.block_until_ready()
     print(f"  Compilation done in {time.time() - t_c:.1f}s")
     print(f"  Initial loss = {float(_l):.6f}")
