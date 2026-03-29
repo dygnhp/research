@@ -29,6 +29,7 @@ Install:
 
 from pathlib import Path
 import os
+import sys
 
 # JAX memory control -- must be set before importing jax
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -49,6 +50,11 @@ import time
 
 _HERE = Path(__file__).resolve().parent
 _BLOCK_II_DIR = _HERE.parent / "block_ii"
+
+# Import shared data generator
+sys.path.insert(0, str(_HERE.parent))
+from data_generator import (generate_dataset, generate_random_O,
+                             generate_random_X, O_CANONICAL, X_CANONICAL)
 
 print("=" * 62)
 print("BLOCK III: Generalization & Robustness Evaluation")
@@ -80,29 +86,10 @@ CONV_P_THR = 0.5
 
 
 # ===========================================================================
-# SECTION 2: Test Images  (original O/X from Block I/II)
+# SECTION 2: Test Images  (canonical O/X from data_generator)
 # ===========================================================================
-O_IMAGE = np.array([
-    [0,0,0,0,0,0,0,0],
-    [0,0,1,1,1,1,0,0],
-    [0,1,0,0,0,0,1,0],
-    [0,1,0,0,0,0,1,0],
-    [0,1,0,0,0,0,1,0],
-    [0,1,0,0,0,0,1,0],
-    [0,0,1,1,1,1,0,0],
-    [0,0,0,0,0,0,0,0],
-], dtype=float)
-
-X_IMAGE = np.array([
-    [1,0,0,0,0,0,0,1],
-    [0,1,0,0,0,0,1,0],
-    [0,0,1,0,0,1,0,0],
-    [0,0,0,1,1,0,0,0],
-    [0,0,0,1,1,0,0,0],
-    [0,0,1,0,0,1,0,0],
-    [0,1,0,0,0,0,1,0],
-    [1,0,0,0,0,0,0,1],
-], dtype=float)
+O_IMAGE = O_CANONICAL
+X_IMAGE = X_CANONICAL
 
 
 # ===========================================================================
@@ -322,10 +309,10 @@ MU_FROZEN    = jnp.array([[ 8.0,  8.0,  0.88],
                             [-8.0, -8.0,  0.12]], dtype=jnp.float32)
 SIGMA_FROZEN = jnp.array([2.0, 2.0])
 
-_w_stones   = np.array([-0.5, -0.5], dtype=np.float32)
-_mu_stones  = np.array([[ 6.0,  6.0, 0.5],
-                         [-2.0, -2.0, 0.5]], dtype=np.float32)
-_sig_stones = np.array([2.0, 2.0], dtype=np.float32)
+_w_stones   = np.array([-1.0, -1.0], dtype=np.float32)
+_mu_stones  = np.array([[ 6.0,  6.0, 0.88],
+                         [ 0.0,  0.0, 0.12]], dtype=np.float32)
+_sig_stones = np.array([3.0, 3.0], dtype=np.float32)
 
 _free_mu = np.array([
     [0.5, 6.0, 0.5], [2.5, 6.0, 0.5], [4.5, 6.0, 0.5], [6.5, 6.0, 0.5],
@@ -901,9 +888,27 @@ def run_evaluation():
           f"[{float(jnp.min(sigma)):.3f}, {float(jnp.max(sigma)):.3f}]")
 
     # ── Step 2: Baseline evaluation ──────────────────────────────────────
-    print("\n[Step 2] Baseline evaluation (original O/X):")
+    print("\n[Step 2] Baseline evaluation (canonical O/X):")
     baseline = {'O': O_IMAGE, 'X': X_IMAGE}
     baseline_results = evaluate_suite(baseline, w, mu, sigma)
+
+    # ── Step 2b: Dataset-variant evaluation ──────────────────────────────
+    print("\n[Step 2b] Dataset-variant evaluation (generated O/X variants):")
+    eval_ds = generate_dataset(n_per_class=20, seed=99)
+    n_ok_O, n_ok_X = 0, 0
+    for i, img in enumerate(eval_ds['O_images']):
+        r = evaluate_single(img, w, mu, sigma, label=f'O_v{i}')
+        if r['pred'] == 'O':
+            n_ok_O += 1
+    for i, img in enumerate(eval_ds['X_images']):
+        r = evaluate_single(img, w, mu, sigma, label=f'X_v{i}')
+        if r['pred'] == 'X':
+            n_ok_X += 1
+    n_ds = eval_ds['n_per_class']
+    print(f"    O variants: {n_ok_O}/{n_ds} correct ({n_ok_O/n_ds:.0%})")
+    print(f"    X variants: {n_ok_X}/{n_ds} correct ({n_ok_X/n_ds:.0%})")
+    ds_acc = (n_ok_O + n_ok_X) / (2 * n_ds)
+    print(f"    Overall dataset accuracy: {ds_acc:.0%}")
 
     # ── Step 3: Noise robustness ─────────────────────────────────────────
     print("\n[Step 3] Noise robustness sweep:")
