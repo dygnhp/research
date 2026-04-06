@@ -1,0 +1,40 @@
+{
+  "trial_id": 1,
+  "tag": "block3_trial01",
+  "GAMMA": 1.5,
+  "T_FINAL": 10.0,
+  "DT": 0.05,
+  "N_STEPS": 200,
+  "N_MAX": 64,
+  "TAU": 0.5,
+  "LAMBDA_P": 0.1,
+  "D_INIT": 3,
+  "D_MAX": 5,
+  "K_INIT": 16,
+  "K_GROW": 4,
+  "K_MAX": 32,
+  "N_FROZEN": 2,
+  "N_STONES": 2,
+  "N_EPOCHS": 3000,
+  "PEAK_LR": 0.005,
+  "END_LR": 1e-05,
+  "WARMUP_STEPS": 100,
+  "LOG_EVERY": 20,
+  "SAVE_EVERY": 500,
+  "CONV_Q_THR": 2.0,
+  "CONV_P_THR": 0.5,
+  "PLATEAU_WINDOW": 100,
+  "PLATEAU_THRESHOLD": 0.01,
+  "MIN_EPOCHS_BEFORE_GROW": 200,
+  "COOLDOWN_AFTER_GROW": 100,
+  "N_TRAIN_PER_CLASS": 50,
+  "DATASET_SEED": 42,
+  "Q_STAR_O_2D": [
+    8.0,
+    8.0
+  ],
+  "Q_STAR_X_2D": [
+    -8.0,
+    -8.0
+  ]
+}
