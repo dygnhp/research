@@ -70,12 +70,12 @@ class Config:
         self.TAU       = 0.5
         self.LAMBDA_P  = 0.1
 
-        # Dimensions
+        # Dimensions (no hard upper limit -- set to float('inf') for unlimited)
         self.D_INIT    = 3       # starting dimension
-        self.D_MAX     = 6       # maximum dimension
+        self.D_MAX     = float('inf')  # no cap on dimension growth
         self.K_INIT    = 16      # starting RBF count (2 frozen + 2 stones + 12 free)
         self.K_GROW    = 4       # RBFs added per growth event
-        self.K_MAX     = 32      # maximum total RBF count
+        self.K_MAX     = float('inf')  # no cap on RBF count growth
         self.N_FROZEN  = 2       # frozen attractors (k=0, k=1)
         self.N_STONES  = 2       # stepping stones (k=2, k=3)
 
@@ -94,6 +94,7 @@ class Config:
         self.PLATEAU_THRESHOLD = 0.01  # relative improvement threshold
         self.MIN_EPOCHS_BEFORE_GROW = 200  # minimum epochs before first growth
         self.COOLDOWN_AFTER_GROW    = 100  # epochs to wait after growth
+        self.K_GROWS_BEFORE_D = 3     # consecutive K growths before trying D growth
 
         # Dataset
         self.N_TRAIN_PER_CLASS = 50
@@ -116,8 +117,17 @@ class Config:
         return np.concatenate([base, np.zeros(D - 2, dtype=np.float32)])
 
     def to_dict(self):
-        return {k: v for k, v in self.__dict__.items()
-                if not k.startswith('_') and not callable(v)}
+        d = {}
+        for k, v in self.__dict__.items():
+            if k.startswith('_') or callable(v):
+                continue
+            if isinstance(v, float) and v == float('inf'):
+                d[k] = "unlimited"
+            elif isinstance(v, np.ndarray):
+                d[k] = v.tolist()
+            else:
+                d[k] = v
+        return d
 
 
 # ===========================================================================
@@ -573,10 +583,13 @@ def prepare_training_data(D, cfg):
             jnp.stack(S0_X_list), jnp.stack(mask_X_list))
 
 
-def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
+def run_adaptive_training(trial_id=1, cfg=None, terrain_viz=True,
+                          **cfg_overrides):
     """
     Main Block III adaptive training loop.
 
+    Args:
+        terrain_viz : if True, capture terrain frames and save animation/filmstrip
     Returns: (final_params, D_final, K_final, trial_manager)
     """
     if cfg is None:
@@ -585,6 +598,16 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
     trial = TrialManager(trial_id, cfg)
     trial.save_config()
     trial.save_dataset()
+
+    # Terrain visualizer (captures potential landscape evolution)
+    _terrain = None
+    if terrain_viz:
+        try:
+            from terrain_viz import TerrainVisualizer
+            _terrain = TerrainVisualizer(resolution=100)
+            print("  [Terrain] 3D visualizer attached")
+        except ImportError:
+            print("  [Terrain] terrain_viz.py not found, skipping")
 
     # Current state
     D = cfg.D_INIT
@@ -632,7 +655,9 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
     print(f"\n{'='*62}")
     print(f"BLOCK III ADAPTIVE TRAINING  (trial={trial_id})")
     print(f"{'='*62}")
-    print(f"  D={D}  K={K}  D_max={cfg.D_MAX}  K_max={cfg.K_MAX}")
+    d_max_s = "unlimited" if cfg.D_MAX == float('inf') else str(cfg.D_MAX)
+    k_max_s = "unlimited" if cfg.K_MAX == float('inf') else str(cfg.K_MAX)
+    print(f"  D={D}  K={K}  D_max={d_max_s}  K_max={k_max_s}")
     print(f"  Epochs={cfg.N_EPOCHS}  peak_lr={cfg.PEAK_LR}")
     print(f"  Plateau: window={cfg.PLATEAU_WINDOW}  threshold={cfg.PLATEAU_THRESHOLD}")
     print(f"  Dataset: {n_train} variants/class")
@@ -640,9 +665,10 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
 
     # Optimizer + training step (rebuilt on growth)
     def make_optimizer_and_step():
+        decay_steps = max(cfg.N_EPOCHS, cfg.WARMUP_STEPS + 1)
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0, peak_value=cfg.PEAK_LR,
-            warmup_steps=cfg.WARMUP_STEPS, decay_steps=cfg.N_EPOCHS,
+            warmup_steps=cfg.WARMUP_STEPS, decay_steps=decay_steps,
             end_value=cfg.END_LR)
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
@@ -665,6 +691,7 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
 
     epoch_converged = None
     last_growth_epoch = -cfg.COOLDOWN_AFTER_GROW  # allow immediate first check
+    consecutive_k_grows = 0  # track K growths to alternate with D
     t_start = time.time()
 
     history = {
@@ -715,6 +742,11 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
                   f"pred={pred_O},{pred_X} | "
                   f"eq=({dOO:.2f},{dXX:.2f})")
 
+            # Capture terrain frame
+            if _terrain is not None:
+                _terrain.update(np.asarray(w_v), np.asarray(mu_v),
+                                np.asarray(sig_v), epoch, float(loss_val))
+
             # Early stopping
             if epoch > 0 and pred_O == 'O' and pred_X == 'X' \
                     and dOO < cfg.CONV_Q_THR and dXX < cfg.CONV_Q_THR:
@@ -729,19 +761,20 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
 
             before = {'D': D, 'K': K}
 
-            if K < cfg.K_MAX:
-                # Try K growth first
-                params, K = grow_K(params, w_frozen, mu_frozen, sigma_frozen,
-                                   D, K, cfg.K_GROW, cfg)
-                trial.log_growth(epoch, 'K_grow', before, {'D': D, 'K': K})
-            elif D < cfg.D_MAX:
-                # K maxed out, grow D
+            # Strategy: grow K first, but after K_GROWS_BEFORE_D consecutive
+            # K growths without convergence, try D growth instead.
+            prefer_D = (consecutive_k_grows >= cfg.K_GROWS_BEFORE_D
+                        and D < cfg.D_MAX)
+
+            if prefer_D:
+                # D growth: expand dimension
+                consecutive_k_grows = 0
                 D_new = D + 1
                 params, w_frozen, mu_frozen, sigma_frozen = grow_D(
                     params, w_frozen, mu_frozen, sigma_frozen, D, D_new, cfg)
                 D = D_new
 
-                # Rebuild everything for new D
+                # Rebuild simulators and data for new D
                 simulate_diff = make_simulate_diff(D, cfg.GAMMA, cfg.DT, cfg.N_STEPS)
                 simulate_eval = make_simulate_eval(D, cfg.GAMMA, cfg.DT, cfg.N_STEPS)
 
@@ -754,8 +787,15 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
                 qX = jnp.array(cfg.q_star('X', D))
 
                 trial.log_growth(epoch, 'D_grow', before, {'D': D, 'K': K})
+            elif K < cfg.K_MAX:
+                # K growth: add more RBFs
+                params, K = grow_K(params, w_frozen, mu_frozen, sigma_frozen,
+                                   D, K, cfg.K_GROW, cfg)
+                consecutive_k_grows += 1
+                trial.log_growth(epoch, 'K_grow', before, {'D': D, 'K': K})
             else:
-                print(f"  [GROW] D={D} and K={K} both at max. No growth possible.")
+                # Both at finite caps (only possible if user sets finite caps)
+                print(f"  [GROW] D and K both at cap. No growth possible.")
                 continue
 
             # Rebuild optimizer (fresh state for new params)
@@ -780,6 +820,13 @@ def run_adaptive_training(trial_id=1, cfg=None, **cfg_overrides):
     with open(hist_path, 'w') as f:
         json.dump(history, f, indent=2)
     print(f"  [History] {hist_path}")
+
+    # Save terrain visualizations
+    if _terrain is not None and len(_terrain.frames) >= 2:
+        tag = trial.tag()
+        _terrain.save_filmstrip(str(trial.output_dir / f"{tag}_terrain_filmstrip.png"))
+        _terrain.save_animation(str(trial.output_dir / f"{tag}_terrain_evolution.gif"))
+        _terrain.save_comparison(str(trial.output_dir / f"{tag}_terrain_comparison.png"))
 
     return params, D, K, w_frozen, mu_frozen, sigma_frozen, trial, history
 
@@ -850,9 +897,8 @@ if __name__ == "__main__":
         N_EPOCHS=3000,
         PEAK_LR=5e-3,
         D_INIT=3,
-        D_MAX=5,
+        # D_MAX and K_MAX default to unlimited (float('inf'))
         K_INIT=16,
-        K_MAX=32,
         K_GROW=4,
         PLATEAU_WINDOW=100,
         PLATEAU_THRESHOLD=0.01,
