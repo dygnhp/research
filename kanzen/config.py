@@ -1,105 +1,219 @@
 """
 Configuration for the Contact Hamiltonian Machine (CHM).
 
-A single dataclass-like Config object holds every hyperparameter so that
-training, evaluation, and growth share the same source of truth.
+A single Config dataclass holds every hyperparameter so that training,
+evaluation, and growth share the same source of truth.
 
-All numeric defaults follow the MD specification (Sections 3-9).
+The 'dataset' field selects one of the entries in data.DATASETS, which
+in turn determines the image size, the class set, the attractor layout,
+and the padded particle slot count.
+
+Per-dataset training defaults (n_epochs, K_init, plateau_window, etc.)
+are baked into _DATASET_DEFAULTS so each experiment starts from sensible
+values; any of them can still be overridden when the Config is
+constructed.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Tuple
+from dataclasses import dataclass, asdict, field
+from typing import Tuple, Dict, List
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset training defaults
+# ---------------------------------------------------------------------------
+_DATASET_DEFAULTS: Dict[str, Dict] = {
+    "OX_8": {
+        "K_init":           16,    # 2 frozen + 2 stones + 12 free
+        "n_epochs":         3000,
+        "peak_lr":          5e-3,
+        "warmup_steps":     100,
+        "plateau_window":   100,
+        "min_epochs_before_grow": 200,
+        "eps_q_thresh":     2.0,
+        "eps_p_thresh":     0.5,
+        "phase_R2_thresh":  0.90,
+        "frozen_sigma":     5.0,   # Phase A: with attractors moved to symmetric
+                                   # positions (10,10) and (-3,-3), both at
+                                   # distance 9.19 from data center, sigma=5
+                                   # gives Gaussian value ~0.18 at center -
+                                   # actual gradient, neither attractor dominant.
+    },
+    "ABC_16": {
+        "K_init":           21,    # 3 frozen + 3 stones + 15 free
+        "n_epochs":         5000,  # design spec, was 2000
+        "peak_lr":          3e-3,
+        "warmup_steps":     200,
+        "plateau_window":   150,
+        "min_epochs_before_grow": 400,
+        "eps_q_thresh":     3.0,
+        "eps_p_thresh":     0.6,
+        "phase_R2_thresh":  0.85,
+        "frozen_sigma":     8.0,   # Phase A: was 4.0 (=2*s).  Attractors are at
+                                   # distance 14 from data center; sigma=8 gives
+                                   # Gaussian value 0.22 at center, vs 0.02 with
+                                   # sigma=5.  Real gradient at data domain.
+    },
+    "abcd_32": {
+        "K_init":           28,    # 4 frozen + 4 stones + 20 free
+        "n_epochs":         8000,  # design spec, was 800
+        "peak_lr":          2e-3,
+        "warmup_steps":     300,
+        "plateau_window":   200,
+        "min_epochs_before_grow": 600,
+        "eps_q_thresh":     5.0,
+        "eps_p_thresh":     0.8,
+        "phase_R2_thresh":  0.80,
+        "frozen_sigma":     15.0,  # Phase A: was 8.0 (=2*s).  Attractors are at
+                                   # distance 26 from data center; sigma=15 gives
+                                   # Gaussian value 0.22 at center, vs 0.03 with
+                                   # sigma=10.
+        # ---- Phase B (applied only to abcd_32 since ABC_16 already fires D-growth
+        # naturally; abcd_32 has 4 classes and a much larger image, so we
+        # want D-growth to fire earlier and to give more room to absorb each
+        # growth event.) ----
+        "K_grows_before_D":    2,   # was 3 (default); D-growth fires after 2 K-grows
+        "cooldown_after_grow": 200, # was 100; more time before next plateau check
+    },
+}
 
 
 @dataclass
 class Config:
-    # --------------------------------------------------------------
-    # Physics (Sections 3-4)
-    # --------------------------------------------------------------
-    gamma: float = 1.5            # contact dissipation coefficient
-    t_final: float = 10.0         # total simulation horizon
-    dt: float = 0.05              # RK4 step size
-    tau: float = 0.5              # pixel-intensity threshold for particle filtering
-    n_max: int = 64               # padded particle slot count (JIT-stable shape)
+    # ---- Dataset selection -------------------------------------------------
+    dataset: str = "OX_8"
 
-    # --------------------------------------------------------------
-    # Dimension and basis count (Section 7, 8)
-    # --------------------------------------------------------------
-    D_init: int = 3               # starting embedding dimension
-    K_init: int = 16              # starting RBF count
-    n_frozen: int = 2             # frozen attractors (O / X)
-    n_stones: int = 2             # stepping stones (data-proximal)
-    K_grow: int = 4               # RBFs added per K-growth event
-    D_max: int = 8                # cap on dimension growth (unbounded conceptually,
-                                  # but kept finite for JIT compile budget)
-    K_max: int = 64               # cap on basis count
+    # ---- Physics -----------------------------------------------------------
+    gamma: float = 1.5
+    t_final: float = 10.0
+    dt: float = 0.05
 
-    # --------------------------------------------------------------
-    # Training (Section 6)
-    # --------------------------------------------------------------
+    # ---- Dimension and basis count ----------------------------------------
+    D_init: int = 3
+    K_init: int = 16
+    K_grow: int = 4
+    D_max: int = 8
+    K_max: int = 64
+
+    # ---- Training ----------------------------------------------------------
     n_epochs: int = 3000
     peak_lr: float = 5e-3
     end_lr: float = 1e-5
     warmup_steps: int = 100
     grad_clip: float = 1.0
-    lambda_p: float = 0.1          # momentum-penalty weight in the loss
+    lambda_p: float = 0.1
 
-    # --------------------------------------------------------------
-    # Growth triggers (Section 7, 8)
-    # --------------------------------------------------------------
-    plateau_window: int = 100      # epochs averaged when checking plateau
+    # ---- Growth triggers ---------------------------------------------------
+    plateau_window: int = 100
     plateau_threshold: float = 0.01
     min_epochs_before_grow: int = 200
     cooldown_after_grow: int = 100
-    K_grows_before_D: int = 3      # consecutive K-grows before trying D-grow
+    K_grows_before_D: int = 3
 
-    # --------------------------------------------------------------
-    # Convergence gates (Section 5, 9)
-    # --------------------------------------------------------------
+    # ---- Convergence gates -------------------------------------------------
     eps_q_thresh: float = 2.0
     eps_p_thresh: float = 0.5
     phase_R2_thresh: float = 0.90
 
-    # --------------------------------------------------------------
-    # Dataset (Section 2)
-    # --------------------------------------------------------------
+    # ---- Dataset sampling --------------------------------------------------
     n_train_per_class: int = 50
     dataset_seed: int = 42
 
-    # --------------------------------------------------------------
-    # Attractor coordinates in the (x, y) plane (Section 5)
-    # --------------------------------------------------------------
-    q_star_O_xy: Tuple[float, float] = (8.0, 8.0)
-    q_star_X_xy: Tuple[float, float] = (-8.0, -8.0)
+    # ---- Frozen-attractor sigma (Phase A) ---------------------------------
+    # Width of the frozen-attractor Gaussian.  Increased over the original
+    # 2*s value so that the attractor force reaches into the data domain
+    # rather than relying on stepping stones to bridge the gradient gap.
+    frozen_sigma: float = 3.0
 
-    # --------------------------------------------------------------
-    # I/O
-    # --------------------------------------------------------------
+    # ---- I/O ---------------------------------------------------------------
     output_dir: str = "kanzen_runs"
     log_every: int = 20
     save_every: int = 500
+
+    # ---- internal: which keys were left at default vs explicitly set ------
+    _explicit_keys: set = field(default_factory=set, repr=False)
+
+    def __post_init__(self):
+        """Apply per-dataset defaults for any field not explicitly overridden.
+
+        We detect explicit overrides by comparing each field to its
+        dataclass default at construction.  The 'with_dataset' helper below
+        is the recommended way to construct a Config since it makes the
+        intent explicit.
+        """
+        defaults = _DATASET_DEFAULTS.get(self.dataset, {})
+        for key, val in defaults.items():
+            if key in self._explicit_keys:
+                continue
+            if hasattr(self, key):
+                setattr(self, key, val)
+
+    @classmethod
+    def with_dataset(cls, name: str, **overrides) -> "Config":
+        """Construct a Config for the given dataset, with optional overrides.
+
+        Example:
+            cfg = Config.with_dataset("ABC_16", n_epochs=2000)
+        """
+        explicit = set(overrides.keys()) | {"dataset"}
+        kwargs = dict(overrides)
+        kwargs["dataset"] = name
+        kwargs["_explicit_keys"] = explicit
+        return cls(**kwargs)
+
+    # ---- Convenience accessors (lazy-import to avoid circular dep) --------
+    @property
+    def dataset_spec(self):
+        from .data import DATASETS
+        return DATASETS[self.dataset]
+
+    @property
+    def n_classes(self) -> int:
+        return self.dataset_spec.n_classes
+
+    @property
+    def class_labels(self) -> List[str]:
+        return self.dataset_spec.class_labels
+
+    @property
+    def n_max(self) -> int:
+        return self.dataset_spec.n_max
+
+    @property
+    def tau(self) -> float:
+        return self.dataset_spec.tau
 
     @property
     def n_steps(self) -> int:
         return int(self.t_final / self.dt)
 
+    # ---- attractor query --------------------------------------------------
     def q_star(self, label: str, D: int) -> np.ndarray:
-        """Build the attractor target in D dimensions.
+        """Attractor position for a class label in D dimensions.
 
-        The (x, y) coordinates are fixed by config; remaining dimensions are 0.
-        For D >= 3 the z-channel is set to the class-typical connectivity value
-        (0.88 for O, 0.12 for X) so the attractor lives on the class's z-plane.
+        Dimensions 0, 1 are filled with the (x, y) attractor; dimension 2
+        (if present) gets the class-typical connectivity z; dimensions
+        3+ default to 0.5 (mid-range).
         """
-        base_xy = self.q_star_O_xy if label == "O" else self.q_star_X_xy
+        spec = self.dataset_spec
+        if label not in spec.attractor_positions:
+            raise KeyError(f"Label '{label}' not in dataset {self.dataset}")
+        x, y = spec.attractor_positions[label]
         out = np.zeros(D, dtype=np.float32)
-        out[0] = base_xy[0]
-        out[1] = base_xy[1]
+        out[0] = x
+        out[1] = y
         if D >= 3:
-            out[2] = 0.88 if label == "O" else 0.12
+            out[2] = spec.attractor_z[label]
+        if D >= 4:
+            out[3] = 0.5
         return out
+
+    def q_stars(self, D: int) -> np.ndarray:
+        """Stack all class attractors into a (C, D) array."""
+        return np.stack([self.q_star(lab, D) for lab in self.class_labels])
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        d.pop("_explicit_keys", None)
         return d

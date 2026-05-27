@@ -1,59 +1,104 @@
 """
-Forward-only evaluation utilities.
+Forward-only N-class evaluation.
 
-Once training is settled, we use the *evaluation* simulator (no
-checkpoint) to characterize the classifier.  The protocol mirrors the
-spec's "Step 3" classification (Section 5) plus the standard robustness
-suite from Block III (noise, shift, ablation, gamma sweep).
+`classify(image, state, cfg)` runs the simulator once and assigns the
+image to the class whose attractor is closest to the masked center of
+mass at time T.  The rest of the file is convenience: accuracy on a
+collection of images, plus three robustness sweeps (noise / shift /
+gamma) and a standard ablation study.
+
+All functions in this module are forward-only and never touch the
+optimizer state, so they are safe to use on a frozen trained model.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import numpy as np
 import jax.numpy as jnp
 
 from .config import Config
-from .dynamics import make_simulate_eval, split_traj
-from .params import assemble_full, make_frozen
+from .dynamics import make_simulate_eval
+from .params import assemble_full
 from .preprocess import make_S0
 
 
 def classify(image: np.ndarray, state, cfg: Config) -> dict:
-    """Run a forward pass and return the predicted class plus diagnostics."""
+    """Predict the class label for a single image."""
     S0, mask = make_S0(image, D=state.D, tau=cfg.tau, n_max=cfg.n_max)
     w, mu, sigma = assemble_full(state.params, *state.frozen)
     traj = state.simulate_eval(S0, w, mu, sigma)
     q_T = traj[-1, :, :state.D]
     p_T = traj[-1, :, state.D:2 * state.D]
     com = jnp.sum(q_T * mask[:, None], axis=0) / jnp.maximum(jnp.sum(mask), 1)
-    d_O = float(jnp.linalg.norm(com - state.q_star_O))
-    d_X = float(jnp.linalg.norm(com - state.q_star_X))
-    pred = "O" if d_O < d_X else "X"
+    com_np = np.asarray(com)
+
+    distances = {}
+    for c, lab in enumerate(state.class_labels):
+        d = float(jnp.linalg.norm(com - state.q_stars[c]))
+        distances[lab] = d
+    pred = min(distances, key=distances.get)
+
     p_norm_mean = float(jnp.sum(jnp.linalg.norm(p_T, axis=-1) * mask)
                         / jnp.maximum(jnp.sum(mask), 1))
     return {
-        "pred": pred, "d_O": d_O, "d_X": d_X,
-        "com": np.asarray(com), "p_norm_mean": p_norm_mean,
-        "traj": np.asarray(traj), "mask": np.asarray(mask),
+        "pred": pred,
+        "distances": distances,
+        "com": com_np,
+        "p_norm_mean": p_norm_mean,
+        "traj": np.asarray(traj),
+        "mask": np.asarray(mask),
     }
 
 
 def accuracy(images: List[np.ndarray], labels: List[str],
              state, cfg: Config) -> float:
     correct = 0
+    total = 0
     for img, lab in zip(images, labels):
-        r = classify(img, state, cfg)
+        try:
+            r = classify(img, state, cfg)
+        except ValueError:
+            continue
+        total += 1
         if r["pred"] == lab:
             correct += 1
-    return correct / len(images)
+    return correct / max(total, 1)
+
+
+def confusion_matrix(images: List[np.ndarray], labels: List[str],
+                     state, cfg: Config) -> Dict:
+    """Return a confusion matrix and per-class accuracy."""
+    class_set = state.class_labels
+    cm = np.zeros((len(class_set), len(class_set)), dtype=int)
+    idx = {lab: i for i, lab in enumerate(class_set)}
+    for img, true_lab in zip(images, labels):
+        try:
+            r = classify(img, state, cfg)
+        except ValueError:
+            continue
+        cm[idx[true_lab], idx[r["pred"]]] += 1
+    per_class = []
+    for i in range(len(class_set)):
+        total = cm[i].sum()
+        per_class.append(cm[i, i] / max(total, 1))
+    overall = cm.trace() / max(cm.sum(), 1)
+    return {
+        "labels": class_set,
+        "matrix": cm,
+        "per_class_acc": per_class,
+        "overall_acc": float(overall),
+    }
 
 
 def noise_sweep(canonical: np.ndarray, true_label: str,
                 state, cfg: Config,
-                levels: List[int] = None, trials: int = 5, seed: int = 0) -> dict:
-    """Flip 'n_flip' random pixels and record accuracy."""
+                levels: List[int] = None, trials: int = 5,
+                seed: int = 0) -> dict:
     if levels is None:
-        levels = list(range(0, 11))
+        # noise levels scale roughly with image area
+        H, W = canonical.shape
+        max_flips = max(10, H * W // 6)
+        levels = list(np.linspace(0, max_flips, 11, dtype=int))
     rng = np.random.RandomState(seed)
     out = {"levels": levels, "acc": []}
     for n_flip in levels:
@@ -67,7 +112,6 @@ def noise_sweep(canonical: np.ndarray, true_label: str,
             try:
                 r = classify(img, state, cfg)
             except ValueError:
-                # No particles above tau (rare); skip this trial.
                 continue
             if r["pred"] == true_label:
                 hits += 1
@@ -76,53 +120,54 @@ def noise_sweep(canonical: np.ndarray, true_label: str,
 
 
 def shift_sweep(canonical: np.ndarray, true_label: str,
-                state, cfg: Config, dxs=range(-2, 3), dys=range(-2, 3)) -> dict:
-    """Translate the image and record accuracy on each (dx, dy)."""
-    dxs, dys = list(dxs), list(dys)
+                state, cfg: Config, max_shift: int = 2) -> dict:
+    dxs = list(range(-max_shift, max_shift + 1))
+    dys = list(range(-max_shift, max_shift + 1))
     grid = np.zeros((len(dys), len(dxs)), dtype=float)
+    H, W = canonical.shape
     for ix, dx in enumerate(dxs):
         for iy, dy in enumerate(dys):
             shifted = np.zeros_like(canonical)
-            R, C = canonical.shape
-            for r in range(R):
-                for c in range(C):
+            for r in range(H):
+                for c in range(W):
                     rr, cc = r + dy, c + dx
-                    if 0 <= rr < R and 0 <= cc < C:
+                    if 0 <= rr < H and 0 <= cc < W:
                         shifted[rr, cc] = canonical[r, c]
             try:
-                r = classify(shifted, state, cfg)
-                grid[iy, ix] = 1.0 if r["pred"] == true_label else 0.0
+                rr = classify(shifted, state, cfg)
+                grid[iy, ix] = 1.0 if rr["pred"] == true_label else 0.0
             except ValueError:
                 grid[iy, ix] = np.nan
     return {"dxs": dxs, "dys": dys, "grid": grid,
             "acc": float(np.nanmean(grid))}
 
 
-def gamma_sweep(canonical_O: np.ndarray, canonical_X: np.ndarray,
+def gamma_sweep(canonical_per_class: Dict[str, np.ndarray],
                 state, cfg: Config, gammas: List[float] = None) -> dict:
-    """Re-simulate the canonical images with different gamma and record acc."""
+    """Re-simulate the canonical images for each class with several gammas."""
     if gammas is None:
         gammas = [0.5, 1.0, 1.5, 2.0, 3.0]
     out = {"gammas": gammas, "acc": []}
+    prev_sim = state.simulate_eval
     for g in gammas:
-        sim_eval = make_simulate_eval(state.D, g, cfg.dt, cfg.n_steps)
-        prev = state.simulate_eval
-        state.simulate_eval = sim_eval
+        state.simulate_eval = make_simulate_eval(state.D, g, cfg.dt, cfg.n_steps)
         try:
-            rO = classify(canonical_O, state, cfg)
-            rX = classify(canonical_X, state, cfg)
-            ok = int(rO["pred"] == "O") + int(rX["pred"] == "X")
-            out["acc"].append(ok / 2.0)
+            correct = 0
+            total = 0
+            for lab, img in canonical_per_class.items():
+                r = classify(img, state, cfg)
+                total += 1
+                if r["pred"] == lab:
+                    correct += 1
+            out["acc"].append(correct / max(total, 1))
         finally:
-            state.simulate_eval = prev
+            pass
+    state.simulate_eval = prev_sim
     return out
 
 
 def ablation_zero_out(state, k_indices_to_zero: List[int]):
-    """Return a 'shadow' params dict with selected w_k zeroed out.
-
-    k_indices are into the *learnable* w array, NOT the full (frozen+learn) one.
-    """
+    """Build a params dict with the listed learnable indices zeroed."""
     w = np.asarray(state.params["w"]).copy()
     for k in k_indices_to_zero:
         if 0 <= k < len(w):
@@ -134,30 +179,37 @@ def ablation_zero_out(state, k_indices_to_zero: List[int]):
     }
 
 
-def ablation_study(canonical_O: np.ndarray, canonical_X: np.ndarray,
+def ablation_study(canonical_per_class: Dict[str, np.ndarray],
                    state, cfg: Config) -> dict:
-    """Standard 4-variant ablation: full / no stones / no free / attractors only."""
+    """Standard 4-variant ablation:
+        full        / no_stones / no_free / attractors_only
+    """
     K_learn = state.K_learn
-    n_stones = cfg.n_stones
-    stones_idx = list(range(0, n_stones))
-    free_idx = list(range(n_stones, K_learn))
+    n_classes = cfg.n_classes
+    stones_idx = list(range(0, n_classes))      # first C learnable are stones
+    free_idx = list(range(n_classes, K_learn))  # the rest are free RBFs
     variants = {
-        "full":       [],
-        "no_stones":  stones_idx,
-        "no_free":    free_idx,
-        "attractors": stones_idx + free_idx,
+        "full":              [],
+        "no_stones":         stones_idx,
+        "no_free":           free_idx,
+        "attractors_only":   stones_idx + free_idx,
     }
-
     out = {}
-    original_params = state.params
+    original = state.params
     for name, zero in variants.items():
         state.params = ablation_zero_out(state, zero)
-        rO = classify(canonical_O, state, cfg)
-        rX = classify(canonical_X, state, cfg)
+        preds, correct = {}, 0
+        for lab, img in canonical_per_class.items():
+            try:
+                r = classify(img, state, cfg)
+                preds[lab] = r["pred"]
+                if r["pred"] == lab:
+                    correct += 1
+            except ValueError:
+                preds[lab] = "<error>"
         out[name] = {
-            "pred_O": rO["pred"], "pred_X": rX["pred"],
-            "d_O_to_O*": rO["d_O"], "d_X_to_X*": rX["d_X"],
-            "acc": (int(rO["pred"] == "O") + int(rX["pred"] == "X")) / 2.0,
+            "predictions": preds,
+            "acc": correct / max(len(canonical_per_class), 1),
         }
-    state.params = original_params
+    state.params = original
     return out

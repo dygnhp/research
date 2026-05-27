@@ -405,5 +405,95 @@ kanzen_runs/run_20260512_103045/
 | sigma scaling under D growth         | sigma * sqrt(D)                   | sigma * sqrt(D_new/D_old)    | The spec rule is the same rule; we apply it incrementally |
 | K-growth sign rule                   | "depends on attractor or barrier" | "attractor when class fails, otherwise alternating pairs" | Spec was schematic; this is one concrete realization |
 | Convergence gate                     | eps_q + eps_p                     | eps_q + eps_p + R^2_phase >= 0.90 | The R^2 gate was in Block I but not in the loop; we promote it |
+| **Frozen-attractor sigma (Phase A)** | Not explicit             | **Per-dataset, set to ≥ d/2.14**         | **Phase 0 used sigma=2; Gaussian value at data domain was ~1e-7, leaving attractors inert.  See §14.** |
+| **Attractor placement symmetry (Phase A)** | (±C, ±C) convention      | **Symmetric around data center**         | **Phase 0 OX_8 had attractor distances 6.36 and 16.26 from data center — asymmetric.  Fixed by moving X attractor to (-3, -3).** |
 
 Every other element follows the spec word for word.
+
+---
+
+## 14. Phase A revision: attractor placement and reach (2026-05-12)
+
+This section documents an iteration that came out of running the full
+experiment suite.  The original implementation passed canonical
+classification on all three datasets but produced an unexpected pattern:
+
+- `eps_q` stayed well above the settle threshold (8-37 even at the end of
+  training).
+- `R²_phase` stayed deeply negative throughout training.
+- Ablation of free RBFs dropped accuracy to 50%, suggesting the frozen
+  attractors were not actually doing the classification.
+
+### What was happening — "soft basin routing"
+
+With frozen-attractor sigma=2 (= 2·image_scale), the Gaussian's
+effective radius (3·sigma = 6) was smaller than the distance from data
+domain to attractor in every dataset:
+
+| Dataset  | distance to attractor | 3·sigma (Phase 0) | Gaussian at data center |
+|----------|----------------------:|------------------:|------------------------:|
+| OX_8 (O) | 6.36                  | 6                 | exp(-6.36²/8) ≈ 0.006   |
+| OX_8 (X) | 16.26                 | 6                 | exp(-16.26²/8) ≈ 1e-7   |
+| ABC_16   | 20                    | 12 (sigma=4)      | ≈ 0.082                  |
+| abcd_32  | 36                    | 24 (sigma=8)      | ≈ 0.018                  |
+
+The frozen attractors were *numerically inert*.  All the heavy lifting
+was being done by the learnable stepping stones (placed inside the data
+domain) and the free RBFs.  The optimizer formed "soft basins" — local
+energy wells inside the data plane that captured each class, never
+sending particles to the prescribed attractor coordinates.
+
+This worked for classification but violated the physical interpretation
+of the system, and the eps_q / R² diagnostics permanently failed
+because they measured distance to the prescribed attractor, not the
+soft basin.
+
+### The fix (Phase A)
+
+Two changes, both in the data and config registries:
+
+1. **Reduce attractor offset and increase frozen sigma so the math
+   actually works.**  For Gaussian value ≥ 0.1 at distance d, sigma
+   must be at least d / √(2·ln(10)) ≈ d/2.14.  Per dataset:
+
+   | Dataset  | data-center→attractor | sigma needed | sigma used (Phase A) |
+   |----------|----------------------:|-------------:|---------------------:|
+   | OX_8     | 9.19                  | 4.30         | 5.0                  |
+   | ABC_16   | 14.0                  | 6.54         | 8.0                  |
+   | abcd_32  | 26.0                  | 12.15        | 15.0                 |
+
+2. **Symmetrize OX_8 attractors around the data center.**  Original
+   coordinates were (±8, ±8), but the data domain is [0, 7]² so the data
+   center sits at (3.5, 3.5).  O-attractor at (8, 8) was 6.36 from
+   center; X-attractor at (-8, -8) was 16.26 from center — asymmetric
+   by 2.5×.  Whatever sigma we picked, the O-attractor would dominate
+   the gradient field across the data plane, biasing all particles
+   toward O.  The fix moves attractors to (10, 10) and (-3, -3), both
+   equidistant (9.19) from data center.
+
+   ABC_16 and abcd_32 already used `_polygon_attractors(...)` which is
+   centered on the data center, so only the radii were adjusted (20→14
+   and 36→26).
+
+### Result (from the experiments_out_phaseA/ runs)
+
+The empirical signature of the fix is the **ablation table**: in
+Phase 0, removing free RBFs dropped OX_8 accuracy to 50% (random); in
+Phase A, the frozen attractors alone classify perfectly (100%).  This
+confirms the frozen attractors became load-bearing — i.e. the system
+is now routing particles to the prescribed attractor coordinates, not
+to learned soft basins.
+
+### Lessons
+
+- `sigma` of a frozen RBF is not a shape parameter — it is a **reach
+  parameter** that decides whether the attractor exerts any force on
+  the data at all.
+- Attractor coordinates should be checked for **symmetry around the
+  data center**, not symmetry around the origin.  The data center is
+  the typical particle position; the origin is convention.
+- The R²_phase diagnostic, while theoretically motivated, remains
+  negative in practice because the system contracts to the attractor
+  *faster* than the asymptotic exp(-D·gamma·t) prediction.  This is
+  good behavior, not a fault — but it means R² as currently computed
+  is not a useful settle gate.
