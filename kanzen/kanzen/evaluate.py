@@ -149,9 +149,11 @@ def gamma_sweep(canonical_per_class: Dict[str, np.ndarray],
         gammas = [0.5, 1.0, 1.5, 2.0, 3.0]
     out = {"gammas": gammas, "acc": []}
     prev_sim = state.simulate_eval
-    for g in gammas:
-        state.simulate_eval = make_simulate_eval(state.D, g, cfg.dt, cfg.n_steps)
-        try:
+    try:
+        for g in gammas:
+            state.simulate_eval = make_simulate_eval(
+                state.D, g, cfg.dt, cfg.n_steps,
+                cfg.sigma_min, cfg.sigma_max)
             correct = 0
             total = 0
             for lab, img in canonical_per_class.items():
@@ -160,9 +162,10 @@ def gamma_sweep(canonical_per_class: Dict[str, np.ndarray],
                 if r["pred"] == lab:
                     correct += 1
             out["acc"].append(correct / max(total, 1))
-        finally:
-            pass
-    state.simulate_eval = prev_sim
+    finally:
+        # Always restore the original simulator, even if classify raised
+        # mid-sweep, so the caller's state object is left consistent.
+        state.simulate_eval = prev_sim
     return out
 
 
@@ -172,11 +175,14 @@ def ablation_zero_out(state, k_indices_to_zero: List[int]):
     for k in k_indices_to_zero:
         if 0 <= k < len(w):
             w[k] = 0.0
-    return {
+    out = {
         "w": jnp.asarray(w),
         "mu": state.params["mu"],
         "sigma_raw": state.params["sigma_raw"],
     }
+    if "attractor_sigma_raw" in state.params:
+        out["attractor_sigma_raw"] = state.params["attractor_sigma_raw"]
+    return out
 
 
 def ablation_study(canonical_per_class: Dict[str, np.ndarray],
@@ -196,20 +202,25 @@ def ablation_study(canonical_per_class: Dict[str, np.ndarray],
     }
     out = {}
     original = state.params
-    for name, zero in variants.items():
-        state.params = ablation_zero_out(state, zero)
-        preds, correct = {}, 0
-        for lab, img in canonical_per_class.items():
-            try:
-                r = classify(img, state, cfg)
-                preds[lab] = r["pred"]
-                if r["pred"] == lab:
-                    correct += 1
-            except ValueError:
-                preds[lab] = "<error>"
-        out[name] = {
-            "predictions": preds,
-            "acc": correct / max(len(canonical_per_class), 1),
-        }
-    state.params = original
+    try:
+        for name, zero in variants.items():
+            state.params = ablation_zero_out(state, zero)
+            preds, correct = {}, 0
+            for lab, img in canonical_per_class.items():
+                try:
+                    r = classify(img, state, cfg)
+                    preds[lab] = r["pred"]
+                    if r["pred"] == lab:
+                        correct += 1
+                except ValueError:
+                    preds[lab] = "<error>"
+            out[name] = {
+                "predictions": preds,
+                "acc": correct / max(len(canonical_per_class), 1),
+            }
+    finally:
+        # Restore the original params unconditionally so that an unexpected
+        # exception in classify does not leave the caller's state holding
+        # the ablated parameters.
+        state.params = original
     return out

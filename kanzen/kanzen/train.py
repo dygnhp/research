@@ -33,7 +33,7 @@ from .config import Config
 from .data import load_dataset
 from .preprocess import make_S0
 from .dynamics import make_simulate_diff, make_simulate_eval
-from .params import make_frozen, make_learnable, assemble_full
+from .params import make_frozen, make_learnable, assemble_full, _image_scale
 from .loss import loss_batch
 from .invariants import epsilon_q, epsilon_p, phase_volume_R2
 from .growth import PlateauDetector, grow_K, grow_D
@@ -44,7 +44,7 @@ class TrainerState:
     D: int
     K_learn: int
     params: Dict[str, jnp.ndarray]
-    frozen: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+    frozen: Tuple[jnp.ndarray, jnp.ndarray]   # (w, mu); attractor sigma is learned
     simulate_diff: callable
     simulate_eval: callable
     optimizer: optax.GradientTransformation
@@ -66,10 +66,39 @@ def _make_lr_schedule(cfg: Config) -> optax.Schedule:
     )
 
 
+def _make_base_optimizer(cfg: Config) -> optax.GradientTransformation:
+    """The base per-parameter update: Adam(W) on the warmup-cosine schedule."""
+    return optax.adamw(learning_rate=_make_lr_schedule(cfg), weight_decay=0.0)
+
+
 def _make_optimizer(cfg: Config) -> optax.GradientTransformation:
+    """Optimizer with a separate route for the learnable attractor sigma.
+
+    Global grad-clipping is applied first (over all params), then
+    multi_transform routes 'attractor_sigma_raw' to either:
+      - a slower Adam (scaled LR) when cfg.learn_attractor_sigma is True, so
+        the attractor influence radius moves more gently than the free RBFs
+        and does not fight them; or
+      - optax.set_to_zero() when False, freezing attractor sigma at its init
+        (exactly reproducing the original frozen-sigma behaviour).
+    """
+    base = _make_base_optimizer(cfg)
+    if cfg.learn_attractor_sigma:
+        attractor_tx = optax.chain(
+            optax.scale(cfg.attractor_sigma_lr_scale),
+            _make_base_optimizer(cfg),
+        )
+    else:
+        attractor_tx = optax.set_to_zero()
+
+    def label_fn(params):
+        return {k: ("attractor_sigma" if k == "attractor_sigma_raw" else "main")
+                for k in params}
+
     return optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),
-        optax.adamw(learning_rate=_make_lr_schedule(cfg), weight_decay=0.0),
+        optax.multi_transform({"main": base, "attractor_sigma": attractor_tx},
+                              label_fn),
     )
 
 
@@ -81,15 +110,23 @@ def _build_state(cfg: Config, D: int,
     else:
         params = prev_params
 
-    sim_diff = make_simulate_diff(D, cfg.gamma, cfg.dt, cfg.n_steps)
-    sim_eval = make_simulate_eval(D, cfg.gamma, cfg.dt, cfg.n_steps)
+    sim_diff = make_simulate_diff(D, cfg.gamma, cfg.dt, cfg.n_steps,
+                                  cfg.sigma_min, cfg.sigma_max)
+    sim_eval = make_simulate_eval(D, cfg.gamma, cfg.dt, cfg.n_steps,
+                                  cfg.sigma_min, cfg.sigma_max)
     optimizer = _make_optimizer(cfg)
     opt_state = optimizer.init(params)
     q_stars = jnp.asarray(cfg.q_stars(D))   # (C, D)
 
+    # Attractor-sigma regularization: pull learned sigma toward its (scaled)
+    # init.  Disabled (lambda 0) when attractor sigma is frozen.
+    attractor_sigma_target = float(cfg.attractor_sigma_init) * _image_scale(cfg)
+    lambda_sigma = cfg.lambda_attractor_sigma if cfg.learn_attractor_sigma else 0.0
+
     def loss_fn(p, S0_batch, mask_batch):
         return loss_batch(sim_diff, p, frozen, D,
-                          S0_batch, mask_batch, q_stars, cfg.lambda_p)
+                          S0_batch, mask_batch, q_stars, cfg.lambda_p,
+                          lambda_sigma, attractor_sigma_target)
 
     grad_fn = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
@@ -158,6 +195,26 @@ def _settled(diag: dict, cfg: Config) -> bool:
                  or diag["R2_min"] >= cfg.phase_R2_thresh))
 
 
+def _snapshot_terrain(state: TrainerState, epoch: int, marker: str = "") -> dict:
+    """Side-effect-only capture of the current terrain for PART 2 viz.
+
+    Copies the learnable params and the frozen block to host numpy so a
+    later step in training (which overwrites state.params) cannot mutate the
+    captured values.  This records nothing that influences the physics or
+    the optimizer -- it only reads state for visualization (PART 2).
+
+    marker : "" (periodic), "[+K]" / "[+D]" (just-grew), "[settled]".
+    """
+    return {
+        "epoch": int(epoch),
+        "D": int(state.D),
+        "K_learn": int(state.K_learn),
+        "marker": marker,
+        "params": {k: np.asarray(v).copy() for k, v in state.params.items()},
+        "frozen": tuple(np.asarray(f).copy() for f in state.frozen),
+    }
+
+
 def train(cfg: Config, verbose: bool = True) -> dict:
     """Run training with autonomous growth.  Returns final state + history."""
     rng = np.random.RandomState(cfg.dataset_seed)
@@ -167,7 +224,8 @@ def train(cfg: Config, verbose: bool = True) -> dict:
     state = _build_state(cfg, D=cfg.D_init)
     detector = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold)
 
-    history = {"loss": [], "epoch": [], "diag": [], "events": []}
+    history = {"loss": [], "epoch": [], "diag": [], "events": [],
+               "terrain_snapshots": []}
     growth_log: List[dict] = []
     last_growth_epoch = -10 ** 9
     consecutive_K_grows = 0
@@ -185,6 +243,13 @@ def train(cfg: Config, verbose: bool = True) -> dict:
         detector.update(loss_f)
         history["loss"].append(loss_f)
         history["epoch"].append(epoch)
+
+        # ---- terrain snapshot (PART 2, side-effect only) ------------------
+        # Capture every 100 epochs and on the final epoch.  Growth events add
+        # their own marked snapshots below so the time-evolution panels line
+        # up with the actual landscape right after each grow.
+        if epoch % 100 == 0 or epoch == cfg.n_epochs - 1:
+            history["terrain_snapshots"].append(_snapshot_terrain(state, epoch))
 
         if (epoch + 1) % cfg.log_every == 0 or epoch == cfg.n_epochs - 1:
             diag = _diagnostics(state, cfg)
@@ -210,6 +275,8 @@ def train(cfg: Config, verbose: bool = True) -> dict:
                 if verbose:
                     print(f"[settled at epoch {epoch}]")
                 history["events"].append({"epoch": epoch, "event": "settled"})
+                history["terrain_snapshots"].append(
+                    _snapshot_terrain(state, epoch, marker="[settled]"))
                 break
 
         # ---- growth trigger -----------------------------------------------
@@ -234,7 +301,9 @@ def train(cfg: Config, verbose: bool = True) -> dict:
                         info["mask"],
                         np.asarray(state.q_stars[c]),
                     ))
-            new_params, _ = grow_K(state.params, state.D, cfg.K_grow, failing)
+            new_params, _ = grow_K(
+                state.params, state.D, cfg.K_grow, failing,
+                image_size=cfg.dataset_spec.image_size)
             state = _build_state(cfg, state.D, prev_params=new_params)
             last_growth_epoch = epoch
             consecutive_K_grows += 1
@@ -242,6 +311,8 @@ def train(cfg: Config, verbose: bool = True) -> dict:
                                "K_learn_after": state.K_learn,
                                "D": state.D})
             history["events"].append(growth_log[-1])
+            history["terrain_snapshots"].append(
+                _snapshot_terrain(state, epoch, marker="[+K]"))
             detector.reset()
             if verbose:
                 print(f"[ep {epoch}] >>> grow_K -> K_learn={state.K_learn}")
@@ -256,6 +327,8 @@ def train(cfg: Config, verbose: bool = True) -> dict:
                                "D_after": state.D,
                                "K_learn": state.K_learn})
             history["events"].append(growth_log[-1])
+            history["terrain_snapshots"].append(
+                _snapshot_terrain(state, epoch, marker="[+D]"))
             detector.reset()
             if verbose:
                 print(f"[ep {epoch}] >>> grow_D -> D={state.D}")
@@ -277,6 +350,7 @@ def save_run(out_dir, run: dict) -> None:
         w=np.asarray(state.params["w"]),
         mu=np.asarray(state.params["mu"]),
         sigma_raw=np.asarray(state.params["sigma_raw"]),
+        attractor_sigma_raw=np.asarray(state.params["attractor_sigma_raw"]),
         D=state.D,
         K_learn=state.K_learn,
     )

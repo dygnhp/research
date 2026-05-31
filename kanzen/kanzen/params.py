@@ -39,15 +39,19 @@ def _image_scale(cfg: Config) -> float:
     return float(W) / 8.0
 
 
-def make_frozen(cfg: Config, D: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """One frozen attractor per class."""
+def make_frozen(cfg: Config, D: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Frozen attractor block: one per class, only (w, mu) are frozen.
+
+    The attractor sigma is NO LONGER part of the frozen block -- it now lives
+    in the learnable parameter pytree (see make_learnable's
+    'attractor_sigma_raw') so the influence radius is learned rather than
+    hand-set.  Only w (depth) and mu (position / label anchor) stay frozen.
+    """
     qs = np.stack([cfg.q_star(lab, D) for lab in cfg.class_labels]).astype(np.float32)
     C = qs.shape[0]
-    s = _image_scale(cfg)
-    w = jnp.full((C,), -2.0, dtype=jnp.float32)
+    w = jnp.full((C,), float(cfg.frozen_w), dtype=jnp.float32)
     mu = jnp.asarray(qs)
-    sigma = jnp.full((C,), 2.0 * s, dtype=jnp.float32)
-    return w, mu, sigma
+    return w, mu
 
 
 def make_learnable(cfg: Config, D: int, rng_seed: int = 0) -> Dict[str, jnp.ndarray]:
@@ -70,11 +74,13 @@ def make_learnable(cfg: Config, D: int, rng_seed: int = 0) -> Dict[str, jnp.ndar
     stone_mu = []
     stone_sigma = []
     for label in cfg.class_labels:
-        ax, ay = spec.attractor_positions[label]
-        z_target = spec.attractor_z[label]
+        # Honor an attractor override so stones aim at the active layout.
+        qs = cfg.q_star(label, max(D, 3))
+        ax, ay = float(qs[0]), float(qs[1])
+        z_target = float(qs[2])
         dx, dy = ax - data_cx, ay - data_cy
         norm = max(np.hypot(dx, dy), 1e-6)
-        dist = 0.35 * norm
+        dist = cfg.stepping_stone_frac * norm
         sx = data_cx + (dx / norm) * dist
         sy = data_cy + (dy / norm) * dist
         # Clip stone position into the image plane so the gradient acts
@@ -129,20 +135,35 @@ def make_learnable(cfg: Config, D: int, rng_seed: int = 0) -> Dict[str, jnp.ndar
     sigma = np.concatenate([np.array(stone_sigma, dtype=np.float32), free_sigma])
     sigma_raw = _softplus_inv(sigma - 0.1)
 
+    # ---- attractor sigma (now a learnable parameter, shape (C,)) ---------
+    # Initialized to the historical fixed value (attractor_sigma_init * s) so
+    # the model's behaviour at step 0 is identical to the frozen-sigma version.
+    n_classes = spec.n_classes
+    attractor_sigma_init = float(cfg.attractor_sigma_init) * s
+    attractor_sigma_raw = _softplus_inv(
+        np.full((n_classes,), attractor_sigma_init - 0.1, dtype=np.float32))
+
     return {
-        "w":         jnp.asarray(w),
-        "mu":        jnp.asarray(mu),
-        "sigma_raw": jnp.asarray(sigma_raw),
+        "w":                  jnp.asarray(w),
+        "mu":                 jnp.asarray(mu),
+        "sigma_raw":          jnp.asarray(sigma_raw),
+        "attractor_sigma_raw": jnp.asarray(attractor_sigma_raw),
     }
 
 
 def assemble_full(params: Dict[str, jnp.ndarray],
                   frozen_w: jnp.ndarray,
-                  frozen_mu: jnp.ndarray,
-                  frozen_sigma: jnp.ndarray):
-    """Stack frozen + learnable into the (w, mu, sigma) the dynamics expects."""
+                  frozen_mu: jnp.ndarray):
+    """Stack frozen + learnable into the (w, mu, sigma) the dynamics expects.
+
+    The frozen block now supplies only (w, mu); the attractor sigma is
+    recovered from the learnable pytree key 'attractor_sigma_raw' and placed
+    at the FRONT of the sigma array so it stays index-aligned with the frozen
+    (w, mu) -- attractors occupy the first C slots of every (w, mu, sigma).
+    """
+    attractor_sigma = jnn.softplus(params["attractor_sigma_raw"]) + 0.1
     sigma_learn = jnn.softplus(params["sigma_raw"]) + 0.1
     w = jnp.concatenate([frozen_w, params["w"]])
     mu = jnp.concatenate([frozen_mu, params["mu"]])
-    sigma = jnp.concatenate([frozen_sigma, sigma_learn])
+    sigma = jnp.concatenate([attractor_sigma, sigma_learn])
     return w, mu, sigma

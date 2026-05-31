@@ -16,7 +16,7 @@ constructed.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import numpy as np
 
 
@@ -70,6 +70,13 @@ class Config:
     t_final: float = 10.0
     dt: float = 0.05
 
+    # ---- Numerical safety --------------------------------------------------
+    # sigma is clipped to [sigma_min, sigma_max] inside the simulator so the
+    # RBF Gaussians never collapse to a delta or spread to a constant.  The
+    # range is exposed here so it can be widened when D / image_scale grows.
+    sigma_min: float = 0.1
+    sigma_max: float = 20.0
+
     # ---- Dimension and basis count ----------------------------------------
     D_init: int = 3
     K_init: int = 16
@@ -84,6 +91,25 @@ class Config:
     warmup_steps: int = 100
     grad_clip: float = 1.0
     lambda_p: float = 0.1
+
+    # ---- Frozen-attractor block (B-bundle + learnable-sigma) ---------------
+    # The attractor mu (position) and w (depth) stay frozen -- mu is the class
+    # label anchor, w guards against the trivial "infinitely deep" solution.
+    # Only the attractor sigma (influence radius) may be learned, so the
+    # landscape's reach is discovered by the dynamics rather than hand-set.
+    frozen_w: float = -2.0               # frozen attractor depth (w), not trained
+    attractor_sigma_init: float = 2.0    # initial attractor sigma (pre image-scale)
+    learn_attractor_sigma: bool = True   # promote attractor sigma to a trained param
+    lambda_attractor_sigma: float = 0.01  # weak L2 pull of attractor sigma to init
+    attractor_sigma_lr_scale: float = 0.2  # attractor sigma moves slower than free RBFs
+    stepping_stone_frac: float = 0.35    # stone placement fraction (data center -> attractor)
+
+    # Optional per-run overrides of the attractor layout.  When None the
+    # dataset's default attractor_positions / attractor_z are used; the runner
+    # sets these for its "improved" preset.  Kept as overrides so the global
+    # DATASETS registry is never mutated (one source of truth = Config).
+    attractor_override: Optional[Dict[str, Tuple[float, float]]] = None
+    attractor_z_override: Optional[Dict[str, float]] = None
 
     # ---- Growth triggers ---------------------------------------------------
     plateau_window: int = 100
@@ -170,16 +196,26 @@ class Config:
         Dimensions 0, 1 are filled with the (x, y) attractor; dimension 2
         (if present) gets the class-typical connectivity z; dimensions
         3+ default to 0.5 (mid-range).
+
+        If attractor_override / attractor_z_override are set on the Config
+        they take precedence over the dataset defaults, without mutating the
+        global DATASETS registry.
         """
         spec = self.dataset_spec
-        if label not in spec.attractor_positions:
+        if self.attractor_override and label in self.attractor_override:
+            x, y = self.attractor_override[label]
+        elif label in spec.attractor_positions:
+            x, y = spec.attractor_positions[label]
+        else:
             raise KeyError(f"Label '{label}' not in dataset {self.dataset}")
-        x, y = spec.attractor_positions[label]
         out = np.zeros(D, dtype=np.float32)
         out[0] = x
         out[1] = y
         if D >= 3:
-            out[2] = spec.attractor_z[label]
+            if self.attractor_z_override and label in self.attractor_z_override:
+                out[2] = self.attractor_z_override[label]
+            else:
+                out[2] = spec.attractor_z[label]
         if D >= 4:
             out[3] = 0.5
         return out

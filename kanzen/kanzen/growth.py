@@ -100,13 +100,21 @@ def grow_K(params: Dict[str, jnp.ndarray],
            D: int,
            K_grow: int,
            diagnostic_per_class: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
-           default_sigma: float = 2.0) -> Tuple[Dict[str, jnp.ndarray], int]:
+           default_sigma: float = 2.0,
+           image_size: Tuple[int, int] = (8, 8)
+           ) -> Tuple[Dict[str, jnp.ndarray], int]:
     """Add K_grow new RBFs to the learnable set.
 
     diagnostic_per_class : list of (traj_q, mask, q_star) tuples for each
                            failing class.  The list length determines how
                            many "guided" placements we make; the rest are
                            placed by alternating signs in the data domain.
+    image_size           : (H, W) of the source image.  Random fill RBFs
+                           are placed uniformly inside [0, W-1] x [0, H-1]
+                           so the growth step is dataset-agnostic (8x8,
+                           16x16, 32x32, ...).  Default (8, 8) preserves
+                           legacy behaviour for any caller that does not
+                           pass this argument.
 
     Returns the new params dict (same keys, longer first axis) and the
     number of RBFs actually added (always == K_grow).
@@ -115,6 +123,8 @@ def grow_K(params: Dict[str, jnp.ndarray],
     mu = np.asarray(params["mu"]).copy()
     sigma_raw = np.asarray(params["sigma_raw"]).copy()
     sigma = np.log1p(np.exp(sigma_raw)) + 0.1  # softplus
+
+    H, W = image_size
 
     new_w_list: List[np.ndarray] = []
     new_mu_list: List[np.ndarray] = []
@@ -135,10 +145,12 @@ def grow_K(params: Dict[str, jnp.ndarray],
     for j in range(fill):
         sign = -1.0 if (j % 2 == 0) else 1.0
         loc = np.zeros(D, dtype=np.float32)
-        loc[0] = rng.uniform(0.0, 7.0)
-        loc[1] = rng.uniform(0.0, 7.0)
+        loc[0] = rng.uniform(0.0, max(W - 1, 1e-3))
+        loc[1] = rng.uniform(0.0, max(H - 1, 1e-3))
         if D >= 3:
             loc[2] = 0.5
+        if D >= 4:
+            loc[3] = 0.5
         new_w_list.append(np.array([sign * 0.3], dtype=np.float32))
         new_mu_list.append(loc.reshape(1, D).astype(np.float32))
         new_sigma_list.append(np.array([default_sigma], dtype=np.float32))
@@ -148,11 +160,16 @@ def grow_K(params: Dict[str, jnp.ndarray],
     new_sigma = np.concatenate([sigma, np.concatenate(new_sigma_list)])
     new_sigma_raw = _softplus_inv(new_sigma - 0.1)
 
-    return {
+    out = {
         "w": jnp.asarray(new_w),
         "mu": jnp.asarray(new_mu),
         "sigma_raw": jnp.asarray(new_sigma_raw),
-    }, K_grow
+    }
+    # grow_K does not change the attractor count (fixed at C classes); carry
+    # the learnable attractor sigma through unchanged.
+    if "attractor_sigma_raw" in params:
+        out["attractor_sigma_raw"] = params["attractor_sigma_raw"]
+    return out, K_grow
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +193,25 @@ def grow_D(params: Dict[str, jnp.ndarray],
     new_mu = np.concatenate([mu, pad], axis=-1)
 
     # Rescale sigma.  sigma is stored as sigma_raw with sigma = softplus(raw) + 0.1.
-    sigma_raw = np.asarray(params["sigma_raw"])
-    sigma = np.log1p(np.exp(sigma_raw)) + 0.1
     scale = float(np.sqrt(D_new / D_old))
-    sigma_new = sigma * scale
-    sigma_raw_new = _softplus_inv(sigma_new - 0.1)
 
-    return {
+    def _scale_sigma_raw(raw):
+        sigma = np.log1p(np.exp(np.asarray(raw))) + 0.1
+        return _softplus_inv(sigma * scale - 0.1)
+
+    sigma_raw_new = _scale_sigma_raw(params["sigma_raw"])
+
+    out = {
         "w": params["w"],
         "mu": jnp.asarray(new_mu),
         "sigma_raw": jnp.asarray(sigma_raw_new),
     }
+    # The learnable attractor sigma must scale by sqrt(D) too, exactly like the
+    # free-RBF sigma, so attractor basins do not collapse in higher dimension.
+    if "attractor_sigma_raw" in params:
+        out["attractor_sigma_raw"] = jnp.asarray(
+            _scale_sigma_raw(params["attractor_sigma_raw"]))
+    return out
 
 
 def grow_frozen_D(frozen_mu: jnp.ndarray,

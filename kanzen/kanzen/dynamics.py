@@ -55,16 +55,24 @@ def make_rk4_step(D: int, gamma: float, dt: float):
     return rk4_step
 
 
-def _sigma_safe(sigma):
-    return jnp.clip(sigma, 0.1, 20.0)
+def _sigma_safe(sigma, sigma_min: float = 0.1, sigma_max: float = 20.0):
+    """Clip sigma into a safe range so the Gaussians never become singular.
+
+    The default bounds match the historical behaviour; both are exposed via
+    Config (sigma_min, sigma_max) and threaded through the simulator
+    constructors below.  Kept as a separate helper so callers/tests can
+    inspect or reuse it without touching the physics core.
+    """
+    return jnp.clip(sigma, sigma_min, sigma_max)
 
 
-def make_simulate_diff(D: int, gamma: float, dt: float, n_steps: int):
+def make_simulate_diff(D: int, gamma: float, dt: float, n_steps: int,
+                       sigma_min: float = 0.1, sigma_max: float = 20.0):
     """Differentiable simulator with checkpointing for O(sqrt(T)) memory."""
     rk4 = make_rk4_step(D, gamma, dt)
 
     def simulate_diff(S0, w, mu, sigma):
-        sigma_s = _sigma_safe(sigma)
+        sigma_s = _sigma_safe(sigma, sigma_min, sigma_max)
 
         @jax_checkpoint
         def step(S, _):
@@ -77,12 +85,13 @@ def make_simulate_diff(D: int, gamma: float, dt: float, n_steps: int):
     return simulate_diff
 
 
-def make_simulate_eval(D: int, gamma: float, dt: float, n_steps: int):
+def make_simulate_eval(D: int, gamma: float, dt: float, n_steps: int,
+                       sigma_min: float = 0.1, sigma_max: float = 20.0):
     """Forward-only simulator (no checkpoint)."""
     rk4 = make_rk4_step(D, gamma, dt)
 
     def simulate_eval(S0, w, mu, sigma):
-        sigma_s = _sigma_safe(sigma)
+        sigma_s = _sigma_safe(sigma, sigma_min, sigma_max)
 
         def step(S, _):
             S_next = rk4(S, w, mu, sigma_s)

@@ -114,16 +114,26 @@ grad_q V(q) = - sum_k  w_k * exp(...) * (q - mu_k) / sigma_k^2
 
 **Parameter roles**.  The K Gaussians are partitioned into three blocks:
 
-| k                                   | role                | learnable? |
-|-------------------------------------|---------------------|------------|
-| 0, 1                                | frozen attractors   | no         |
-| 2, 3                                | stepping stones     | yes        |
-| 4 .. K-1                            | free basis          | yes        |
+| k                                   | role                | learnable?                 |
+|-------------------------------------|---------------------|----------------------------|
+| 0, 1                                | attractors          | mu/w no, **sigma yes**     |
+| 2, 3                                | stepping stones     | yes                        |
+| 4 .. K-1                            | free basis          | yes                        |
 
-The frozen attractors are pinned to the class targets `q*_O = (8, 8, ...)`
+The attractors are pinned (mu, w) to the class targets `q*_O = (8, 8, ...)`
 and `q*_X = (-8, -8, ...)`.  They guarantee that the optimizer is solving
 the right classification problem — the attractor coordinates *are* the
 class identities.
+
+NOTE (B + learnable-sigma): the attractor **mu (position) and w (depth)
+remain frozen** — mu is the label anchor, w guards the trivial "infinitely
+deep" solution — but the attractor **sigma (influence radius) is now a
+learnable parameter** (`params["attractor_sigma_raw"]`, shape `(C,)`),
+controlled by `cfg.learn_attractor_sigma` (default True) with a weak L2 pull
+toward its init (`cfg.lambda_attractor_sigma`) and a slower learning rate
+(`cfg.attractor_sigma_lr_scale`).  `assemble_full` recovers it and places it
+in the first C sigma slots.  The data-center-symmetric "improved" attractor
+layout is opt-in via `cfg.attractor_override` (runner `--attractor improved`).
 
 Stepping stones are placed inside or near the data domain (`(6, 6)` for O
 and `(0, 0)` for X) so that on the first epoch every particle already

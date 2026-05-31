@@ -87,11 +87,18 @@ def cmd_evaluate(cfg: Config) -> None:
     npz = np.load(os.path.join(latest, "params.npz"))
     D = int(npz["D"])
     state = _build_state(cfg, D)
-    state.params = {
+    params = {
         "w": jnp.asarray(npz["w"]),
         "mu": jnp.asarray(npz["mu"]),
         "sigma_raw": jnp.asarray(npz["sigma_raw"]),
     }
+    # attractor_sigma_raw: present in new runs; fall back to the freshly built
+    # init for older params.npz that predate the learnable-sigma change.
+    if "attractor_sigma_raw" in npz.files:
+        params["attractor_sigma_raw"] = jnp.asarray(npz["attractor_sigma_raw"])
+    else:
+        params["attractor_sigma_raw"] = state.params["attractor_sigma_raw"]
+    state.params = params
     state.K_learn = int(npz["K_learn"])
 
     spec = cfg.dataset_spec
