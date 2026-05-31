@@ -34,15 +34,14 @@ from jax import checkpoint as jax_checkpoint
 from functools import partial
 import numpy as np
 import optax
-import time
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _BLOCK_II_DIR = _ROOT / "block_ii"
 
 sys.path.insert(0, str(_ROOT))
-from data_generator import (generate_dataset, O_CANONICAL, X_CANONICAL)
-from evaluation import run_standard_eval
+from LEGACY.data_generator import (generate_dataset, O_CANONICAL, X_CANONICAL)
+from LEGACY.evaluation import run_standard_eval
 
 print("=" * 62)
 print("EVALUATION SYSTEM: Block II Evaluation")
@@ -326,7 +325,7 @@ def load_trained_params(path=None):
 # ===========================================================================
 def fallback_training(n_epochs=200, peak_lr=2e-3):
     """Lightweight training if Block II params unavailable."""
-    from evaluation import com_single, classify_traj
+    from LEGACY.evaluation import com_single
     print(f"\n  Fallback training: {n_epochs} epochs, lr={peak_lr}")
 
     def loss_fn(params):

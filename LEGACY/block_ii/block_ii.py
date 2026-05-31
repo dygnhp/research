@@ -71,7 +71,7 @@ import time
 # Import shared data generator (project root)
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
-from data_generator import generate_dataset, O_CANONICAL, X_CANONICAL
+from LEGACY.data_generator import generate_dataset, O_CANONICAL, X_CANONICAL
 
 print("=" * 62)
 print("JAX version    :", jax.__version__)

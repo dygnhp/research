@@ -3,18 +3,18 @@
 > 데이터셋 선택부터 하이퍼파라미터, 에폭 설정, 정착 조건 해석, 그리고
 > 실패 시나리오의 진단까지를 모은 단일 참고 문서.
 
-CHM의 메커니즘 자체는 [`ALGORITHM.md`](./ALGORITHM.md)를 참고하세요.
+CHM의 메커니즘 자체는 [`ALGORITHM.md`](ALGORITHM.md)를 참고하세요.
 이 문서는 "어떤 데이터로 어떻게 학습할지"의 가이드입니다.
 
 ---
 
 ## 1. 데이터셋 카드
 
-| 데이터셋     | 이미지     | 클래스        | n_max | 끌개 배치 (Phase A) | 캐노니컬 픽셀 수            |
-|--------------|-----------|---------------|-------|--------------------|-----------------------------|
-| `OX_8`       | 8 × 8     | O, X          | 64    | (10,10) & (-3,-3) (데이터 중심 대칭) | O=16, X=16    |
-| `ABC_16`     | 16 × 16   | A, B, C       | 128   | 반지름 14의 정삼각형 (Phase 0: 20) | A=54, B=45, C=38 |
-| `abcd_32`    | 32 × 32   | a, b, c, d    | 400   | 반지름 26의 정사각형 (Phase 0: 36) | a=113, b=126, c=95, d=126 |
+| 데이터셋     | 이미지     | 클래스        | n_max | 끌개 배치             | 캐노니컬 픽셀 수            |
+|--------------|-----------|---------------|-------|----------------------|-----------------------------|
+| `OX_8`       | 8 × 8     | O, X          | 64    | 대각선 두 점          | O=16, X=16                  |
+| `ABC_16`     | 16 × 16   | A, B, C       | 128   | 반지름 20의 정삼각형 | A=54, B=45, C=38            |
+| `abcd_32`    | 32 × 32   | a, b, c, d    | 400   | 반지름 36의 정사각형 | a=113, b=126, c=95, d=126   |
 
 데이터는 모두 합성 파라메트릭 이미지로, 각 클래스는
 
@@ -35,10 +35,10 @@ CHM의 메커니즘 자체는 [`ALGORITHM.md`](./ALGORITHM.md)를 참고하세�
 세 가지 데이터셋 모두 **동일한 학습 코드**로 처리됩니다. 선택은 Config 한 곳에서:
 
 ```python
-from kanzen import Config, train
+from LEGACY.kanzen import Config, train
 
-cfg = Config.with_dataset("ABC_16")           # 디폴트 하이퍼파라미터 자동 적용
-cfg = Config.with_dataset("ABC_16", n_epochs=2000)   # 일부만 오버라이드
+cfg = Config.with_dataset("ABC_16")  # 디폴트 하이퍼파라미터 자동 적용
+cfg = Config.with_dataset("ABC_16", n_epochs=2000)  # 일부만 오버라이드
 run = train(cfg)
 ```
 
@@ -56,7 +56,7 @@ python -m kanzen.main demo  --dataset OX_8
 
 ---
 
-## 3. 권장 하이퍼파라미터 (Phase A 갱신본, 디폴트로 적용됨)
+## 3. 권장 하이퍼파라미터 (디폴트로 적용됨)
 
 | 항목                    | OX_8   | ABC_16 | abcd_32 |
 |-------------------------|-------:|-------:|--------:|
@@ -72,26 +72,6 @@ python -m kanzen.main demo  --dataset OX_8
 | `eps_q_thresh` (정착)   | 2.0    | 3.0    | 5.0     |
 | `eps_p_thresh` (정착)   | 0.5    | 0.6    | 0.8     |
 | `phase_R2_thresh`       | 0.90   | 0.85   | 0.80    |
-| **`frozen_sigma` (Phase A)** | **5.0** | **8.0** | **15.0** |
-| **`K_grows_before_D`**  | 3      | 3      | **2** (Phase B) |
-| **`cooldown_after_grow`** | 100  | 100    | **200** (Phase B) |
-
-### Phase A 핵심 변화점
-
-초기 구현(Phase 0)에서 frozen attractor의 σ가 2.0 (= 2·image_scale) 였는데,
-이는 σ가 데이터 도메인의 거의 절반 정도에서만 의미 있는 force를 가하는
-좁은 값이었다. 결과적으로 **frozen attractor가 inert** 가 되어 학습된
-지형이 데이터 도메인 *내부*에 분류용 basin을 형성하는 \"soft basin
-routing\" 현상이 일어났다.
-
-Phase A 에서는 다음 두 가지를 수정:
-
-1. **σ_frozen 데이터셋별 확장**: $d/2.14$ 룰 (여기서 d는 데이터 중심과
-   끌개 사이 거리)을 적용하여 σ_frozen 이 데이터 도메인에 *닿게* 함.
-2. **OX_8 끌개 좌표 대칭화**: 기존 `(±8, ±8)`은 데이터 중심 (3.5, 3.5)
-   기준 비대칭이었다(O는 거리 6.36, X는 16.26). 이를 `(10, 10)` 과
-   `(-3, -3)` 으로 변경하여 둘 다 데이터 중심에서 거리 9.19 의 대칭
-   배치로 만들었다.
 
 ### 왜 이렇게 차이가 나는가
 
@@ -106,14 +86,9 @@ Phase A 에서는 다음 두 가지를 수정:
 낮추지 않으면 step 크기가 과도해져 발산합니다.
 
 **eps_q_thresh / phase_R2_thresh**: 이미지가 커지면 모든 거리 스케일이
-함께 커지므로 정착 임계값도 비례하여 완화합니다.
-
-**`frozen_sigma`** (Phase A 신규): 끌개의 Gaussian이 데이터 도메인까지 충
-분히 닿도록 데이터셋 크기에 비례하여 키웁니다. 핵심 룰: $\sigma \ge d /
-2.14$ — 여기서 $d$는 데이터 중심에서 끌개까지의 거리. 이 룰이 깨지면
-끌개 force가 사실상 0이 되어 학습된 지형이 데이터 도메인 *내부*에 \"soft
-basin\" 만 만들고, 결과적으로 진짜 끌개에 도달하지 못합니다(Phase 0에서
-관찰됨).
+함께 커지므로 정착 임계값도 비례하여 완화합니다. `R2_thresh`는 입자 수가
+많을수록 위상부피 추정이 통계적으로 더 잘 수렴하므로 큰 데이터셋에서는
+오히려 낮춰도 됩니다 (작은 이상치의 영향이 평균에서 사라지기 때문).
 
 ---
 
@@ -183,7 +158,8 @@ cfg = Config.with_dataset(
 학습된 모델의 robustness 평가.
 
 ```python
-from kanzen import noise_sweep, shift_sweep
+from LEGACY.kanzen import noise_sweep, shift_sweep
+
 acc_noise = noise_sweep(canonical, "A", state, cfg, levels=range(0, 30, 3))
 acc_shift = shift_sweep(canonical, "A", state, cfg, max_shift=3)
 ```

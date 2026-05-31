@@ -32,7 +32,6 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 from jax import checkpoint as jax_checkpoint
-from functools import partial
 import numpy as np
 import optax
 
@@ -40,11 +39,10 @@ _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 
 sys.path.insert(0, str(_ROOT))
-from data_generator import (generate_dataset, O_CANONICAL, X_CANONICAL)
+from LEGACY.data_generator import (generate_dataset, O_CANONICAL, X_CANONICAL)
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 print("=" * 62)
 print("BLOCK III: N-Dimensional Adaptive Processing")
@@ -603,7 +601,7 @@ def run_adaptive_training(trial_id=1, cfg=None, terrain_viz=True,
     _terrain = None
     if terrain_viz:
         try:
-            from terrain_viz import TerrainVisualizer
+            from LEGACY.terrain_viz import TerrainVisualizer
             _terrain = TerrainVisualizer(resolution=100)
             print("  [Terrain] 3D visualizer attached")
         except ImportError:
@@ -841,7 +839,7 @@ def run_block3_evaluation(params, D, K, w_frozen, mu_frozen, sigma_frozen,
     if cfg is None:
         cfg = Config()
 
-    from evaluation import run_standard_eval
+    from LEGACY.evaluation import run_standard_eval
 
     qO = jnp.array(cfg.q_star('O', D))
     qX = jnp.array(cfg.q_star('X', D))
@@ -857,7 +855,7 @@ def run_block3_evaluation(params, D, K, w_frozen, mu_frozen, sigma_frozen,
         return full_params_fn(p, w_frozen, mu_frozen, sigma_frozen)
 
     # Novel patterns
-    from evaluation_system.evaluate_block_ii import NOVEL_IMAGES
+    from LEGACY.evaluation_system.evaluate_block_ii import NOVEL_IMAGES
 
     def dataset_fn():
         return generate_dataset(n_per_class=20, seed=99)

@@ -21,7 +21,7 @@ _ROOT = _HERE.parent.parent
 
 # Add project root so we can import data_generator
 sys.path.insert(0, str(_ROOT))
-from data_generator import generate_dataset, O_CANONICAL, X_CANONICAL
+from LEGACY.data_generator import generate_dataset, O_CANONICAL, X_CANONICAL
 
 
 def save_dataset(out_dir: Path, n_per_class: int = 50, seed: int = 42,
