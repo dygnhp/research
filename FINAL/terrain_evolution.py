@@ -36,6 +36,56 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
 from .params import assemble_full
 from .terrain import rbf_potential
+from .preprocess import preprocess
+
+
+# ---------------------------------------------------------------------------
+# Reference panels (attractors + per-class particle start points)
+# ---------------------------------------------------------------------------
+def _class_colors(n: int):
+    base = plt.get_cmap("tab10")
+    return [base(i % 10) for i in range(n)]
+
+
+def _render_attractor_panel(ax, cfg, D: int, extent):
+    """2D panel marking every class attractor (x, y) with an 'x'."""
+    xmin, xmax, ymin, ymax = extent
+    labels = list(cfg.class_labels)
+    colors = _class_colors(len(labels))
+    for c, lab in enumerate(labels):
+        q = cfg.q_star(lab, max(D, 2))
+        ax.scatter([float(q[0])], [float(q[1])], marker="x", s=170,
+                   c=[colors[c]], linewidths=2.6, zorder=5)
+        ax.annotate(lab, (float(q[0]), float(q[1])),
+                    textcoords="offset points", xytext=(6, 5),
+                    fontsize=11, color=colors[c], fontweight="bold")
+    ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal")
+    ax.set_title("attractors  (x = class target)", fontsize=10)
+    ax.set_xlabel("x", fontsize=8); ax.set_ylabel("y", fontsize=8)
+    ax.tick_params(labelsize=6)
+    ax.grid(True, lw=0.3, alpha=0.4)
+
+
+def _render_start_panel(ax, cfg, label, color, D: int, extent):
+    """2D panel: the (x, y) start positions of the class reference (canonical)
+    image's particles -- where this class's motion begins on the terrain."""
+    xmin, xmax, ymin, ymax = extent
+    canon = cfg.dataset_spec.canonicals[label]
+    q0, _, _, mask = preprocess(canon, D=max(D, 2), tau=cfg.tau,
+                                n_max=cfg.n_max)
+    q0 = np.asarray(q0)
+    m = np.asarray(mask).astype(bool)
+    xy = q0[m][:, :2]
+    ax.scatter(xy[:, 0], xy[:, 1], s=12, c=[color], alpha=0.85,
+               edgecolors="none")
+    ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal")
+    ax.set_title(f"'{label}' start points (t=0, {m.sum()} particles)",
+                 fontsize=10)
+    ax.set_xlabel("x", fontsize=8); ax.set_ylabel("y", fontsize=8)
+    ax.tick_params(labelsize=6)
+    ax.grid(True, lw=0.3, alpha=0.4)
 
 
 # ---------------------------------------------------------------------------
@@ -150,24 +200,41 @@ def make_terrain_evolution_3d(snapshots: List[dict], cfg,
         vmin, vmax = -1.0, 1.0
 
     # ---- layout ----------------------------------------------------------
+    # Prepend reference panels: panel 1 = attractor positions (x marks),
+    # panels 2..C+1 = each class reference's particle start points (t=0).
+    labels = list(cfg.class_labels)
+    C = len(labels)
+    ref_colors = _class_colors(C)
+    extent = (xmin, xmax, ymin, ymax)
+    ref_D = snaps[0]["D"]
+    n_ref = 1 + C                       # attractors + one per class
+
     n = len(snaps)
     n_cols = 4
-    n_rows = int(np.ceil(n / n_cols))
+    n_rows = int(np.ceil((n_ref + n) / n_cols))
     panel_in = 4.2
     fig = plt.figure(figsize=(n_cols * panel_in, n_rows * panel_in))
 
     grow_K_count = sum(1 for s in snaps if s.get("marker") == "[+K]")
     grow_D_count = sum(1 for s in snaps if s.get("marker") == "[+D]")
 
+    # reference panel 1: attractors
+    _render_attractor_panel(fig.add_subplot(n_rows, n_cols, 1),
+                            cfg, ref_D, extent)
+    # reference panels 2..C+1: per-class particle start points
+    for ci, lab in enumerate(labels):
+        _render_start_panel(fig.add_subplot(n_rows, n_cols, 2 + ci),
+                            cfg, lab, ref_colors[ci], ref_D, extent)
+
     for i, (s, ZZ) in enumerate(zip(snaps, surfaces)):
-        r, c = divmod(i, n_cols)
+        panel_idx = n_ref + i + 1       # snapshot panels follow the reference ones
         ep, D, K = s["epoch"], s["D"], s["K_learn"]
         marker = s.get("marker", "")
         mtag = f" {marker}" if marker else ""
 
         if ZZ is not None:
             # ---- 3D surface panel (D <= 3) -------------------------------
-            ax = fig.add_subplot(n_rows, n_cols, i + 1, projection="3d")
+            ax = fig.add_subplot(n_rows, n_cols, panel_idx, projection="3d")
             ax.plot_surface(XX, YY, ZZ, cmap="RdBu_r",
                             vmin=vmin, vmax=vmax,
                             linewidth=0, antialiased=True)
@@ -185,7 +252,7 @@ def make_terrain_evolution_3d(snapshots: List[dict], cfg,
             ax.set_title(f"epoch {ep} (D={D}, K={K}){mtag}", fontsize=10)
         else:
             # ---- text panel (D >= 4) -------------------------------------
-            ax = fig.add_subplot(n_rows, n_cols, i + 1)
+            ax = fig.add_subplot(n_rows, n_cols, panel_idx)
             ax.axis("off")
             ax.add_patch(plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes,
                                        facecolor="0.92", edgecolor="0.7"))
@@ -217,6 +284,7 @@ def make_terrain_evolution_3d(snapshots: List[dict], cfg,
 
     # ---- report ----------------------------------------------------------
     ep_lo, ep_hi = snaps[0]["epoch"], snaps[-1]["epoch"]
+    print(f"[terrain-3d] 참조 패널: 끌개 1 + 클래스 시작점 {C} = {n_ref}개 (맨 앞)")
     print(f"[terrain-3d] 스냅샷 수: {n} (epoch {ep_lo}~{ep_hi})")
     print(f"[terrain-3d] 3D 곡면 패널(D<=3): {n_surface}개 / "
           f"텍스트 패널(D>=4): {n_text}개")

@@ -10,3 +10,7 @@ env/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# --- Experiment outputs (regenerable; large 3D PNGs + binary params) ---
+# Findings are committed in EXPERIMENT_RESULTS.md; raw outputs stay local.
+research/
