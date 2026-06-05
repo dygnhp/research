@@ -92,3 +92,32 @@ seed 42/1 (각 2회), OX/ABC=CPU, abcd=GPU. 원본 출력은 research/main_exp_1
 - d 76->100%, b 95->100%, c 58->64%, **전체 variant 71->75.5%** (d가 a를 흉내내던 혼동 해소).
 - 그러나 **새 'a' 자체는 55->38%로 악화** (2층 a가 CoM 라우팅엔 더 어려움).
 - 결론: a/d 혼동의 진짜 레버는 데이터/특징/지형이지 끌개 배치가 아님. **'a'는 원본으로 원복**(데이터셋 표준 유지). 끌개 위치(mu) 학습은 자명해 위험 + a/d 동일입력 미해결로 보류.
+
+## 6. 제2차 본실험 (3-seed 재현성, improved + sigma 학습, 전체 예산)
+
+seed 42/1/2. main_exp_1과 동일 설정. 원본 출력은 research/main_exp_2/ (gitignore).
+
+| dataset | canonical | variant 평균±std | D/K | device |
+|---|---|---|---|---|
+| OX_8 | 2/2 (전부 100%) | **86.3 ± 3.1%** (83/89/87) | 6/54 | CPU (+phase gallery) |
+| ABC_16 | 3/3 (전부 100%) | **93.3 ± 0.7%** (94/92.7/93.3) | 5/37 | CPU |
+| abcd_32 | 4/4 (전부 100%) | **70.8 ± 1.5%** (69.5/72.5/70.5) | 6/56-60 | GPU |
+
+- canonical 3종 모두 100% (3 seed 전부), 변산 작음 -> **높은 재현성** (1차 결과와 일치).
+- OX는 입자별 phase-space 갤러리 동반 생성 (12입자 x 2클래스 x 3 seed).
+
+## 7. ANN 대조군 (TensorFlow Sequential, control/ann_baseline.py)
+
+동일 데이터, Flatten -> Dense(32, relu) -> Dense(C, softmax). **5 seed(42,1,2,3,4)** 평균±std.
+FLOPs 비교는 추후. (원본 research/ann_control.json, gitignore)
+
+| dataset | ANN params | ANN canonical | ANN held-out (평균±std) | CHM params | CHM variant |
+|---|---|---|---|---|---|
+| OX_8 | 2,146 | 100% | **99.4 ± 0.5%** | ~434 | 86.3% |
+| ABC_16 | 8,323 | 100% | **100 ± 0%** | ~262 | 93.3% |
+| abcd_32 | 32,932 | 100% | **100 ± 0%** | ~470 | 70.8% |
+
+- **표준 MLP는 3종 모두 100%** (미학습 held-out 포함). 합성 글자는 black-box ANN엔 사소.
+- **ANN이 abcd a/d도 100% 분리** -> a/d 구분 정보는 **픽셀에 분명히 존재**; CHM의 어려움은 데이터가 아니라 **"거의 동일한 입자구름의 CoM 라우팅"이라는 표현방식의 한계**.
+- ANN은 파라미터 많음(입력->은닉 행렬). CHM은 lifted 입자공간에서 동작해 **파라미터 효율적**.
+- **ANN=black-box vs CHM=white-box** -> CHM은 정확도/연산을 **해석가능성과 맞바꿈**. (FLOPs 측정이 그 trade-off를 정량화할 예정)

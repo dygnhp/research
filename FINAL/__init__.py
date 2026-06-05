@@ -71,6 +71,7 @@ from .evaluate import (classify, accuracy, confusion_matrix,
 from .viz import summary_figure
 from .gallery import make_dataset_gallery
 from .terrain_evolution import make_terrain_evolution_3d
+from .phase_gallery import make_phase_space_gallery, make_phase_galleries
 
 __all__ = [
     "report_device",
@@ -92,4 +93,5 @@ __all__ = [
     "noise_sweep", "shift_sweep", "gamma_sweep", "ablation_study",
     "summary_figure",
     "make_dataset_gallery", "make_terrain_evolution_3d",
+    "make_phase_space_gallery", "make_phase_galleries",
 ]
