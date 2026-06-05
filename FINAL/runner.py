@@ -391,6 +391,13 @@ def run(args) -> str:
         "dataset_gallery.png", "terrain_evolution_3d.png",
         final_attractor_sigma)
 
+    # ---- 6) optional per-particle phase-space galleries ------------------
+    if args.phase_gallery:
+        print("[runner] 위상공간 갤러리 생성 중...")
+        from .phase_gallery import make_phase_galleries
+        make_phase_galleries(state, cfg, out_dir,
+                             max_particles=args.phase_max_particles)
+
     # ---- summary ---------------------------------------------------------
     print("\n=== 실험 완료 ===")
     print(f"정확도(canonical): {eval_d['canon_correct']}/{eval_d['canon_total']}"
@@ -431,6 +438,13 @@ def main(argv=None):
                              "freeze it at init)")
     parser.add_argument("--out-base", dest="out_base", default=None,
                         help="experiment base dir (default research/experiment)")
+    parser.add_argument("--phase-gallery", dest="phase_gallery",
+                        action="store_true",
+                        help="after the experiment, render per-particle "
+                             "phase-space (q_d, p_d) galleries")
+    parser.add_argument("--phase-max-particles", dest="phase_max_particles",
+                        type=int, default=12,
+                        help="particles per class for --phase-gallery (0 = all)")
     parser.add_argument("--yes", action="store_true",
                         help="skip the confirmation prompt")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",

@@ -46,7 +46,31 @@ containing: `results.md`, `dataset_gallery.png`, `terrain_evolution_3d.png`,
 | `--attractor {default,improved}` | attractor layout | default |
 | `--learn-sigma / --no-learn-sigma` | learn attractor sigma | learn |
 | `--device {auto,gpu,cpu}` | backend (Windows = CPU; GPU via WSL2) | auto |
+| `--phase-gallery` | after the run, render per-particle phase-space galleries | off |
+| `--phase-max-particles N` | particles per class for `--phase-gallery` (0 = all) | 12 |
 | `--dry-run` / `--yes` | estimate only / skip confirm | — |
+
+### Per-particle phase-space gallery
+
+For each class reference, render one gallery per particle with a `(q_d, p_d)`
+phase-plane per dimension -- the position-vs-momentum trajectory over time
+(line + equal-time sample points, colored by time; the dotted line is `p=0`
+and the dashed line is the attractor target `q*_d`). The contact dynamics is
+dissipative, so each trajectory settles toward `(q*_d, 0)`.
+
+Generate during a run, or standalone on a saved experiment:
+
+```bash
+# during a run:
+python -m FINAL.runner --dataset OX --epochs 3000 --phase-gallery --yes
+
+# standalone, from any saved exp_NNN/ (params.npz + config.json):
+python -m FINAL.phase_gallery --exp research/experiment/exp_001 \
+       --class O --max-particles 12
+```
+
+Output: `<exp>/phase_space/<label>_pNN.png`. NB: a class reference can have
+100+ particles (abcd), so `--phase-max-particles` caps the count.
 
 ---
 
