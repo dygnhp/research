@@ -120,37 +120,65 @@ _CHM_REF = {
 
 
 def main(argv=None):
+    import json
     parser = argparse.ArgumentParser(prog="control.ann_baseline")
     parser.add_argument("--datasets", default="OX_8,ABC_16,abcd_32",
                         help="comma-separated dataset names")
     parser.add_argument("--hidden", type=int, default=32,
                         help="hidden units in the single Dense layer")
     parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seeds", default="42,1,2,3,4",
+                        help="comma-separated seeds (one ANN run each)")
+    parser.add_argument("--out", default=None,
+                        help="optional JSON path for the aggregated results")
     args = parser.parse_args(argv)
 
-    rows = []
-    for name in args.datasets.split(","):
-        name = name.strip()
-        r = run_dataset(name, hidden=args.hidden, epochs=args.epochs,
-                        seed=args.seed)
-        rows.append(r)
-        print(f"[ANN] {name:8s} hidden={r['hidden']} params={r['params']:5d} | "
-              f"canonical={r['canonical']:.2f} "
-              f"train_var={r['train_variant']:.2f} "
-              f"heldout={r['heldout']:.2f}", flush=True)
+    datasets = [d.strip() for d in args.datasets.split(",")]
+    seeds = [int(s) for s in args.seeds.split(",")]
 
-    print("\n=== ANN (control) vs CHM (main_exp_2) ===")
-    print(f"{'dataset':9s} | {'ANN params':10s} {'ANN canon':9s} "
-          f"{'ANN heldout':11s} | {'CHM params':14s} {'CHM canon':9s} "
-          f"{'CHM variant':11s}")
-    for r in rows:
-        c = _CHM_REF.get(r["dataset"], {})
-        print(f"{r['dataset']:9s} | {r['params']:<10d} {r['canonical']:<9.2f} "
-              f"{r['heldout']:<11.2f} | {str(c.get('params','?')):14s} "
-              f"{c.get('canonical','?'):<9} {c.get('variant','?'):<11}")
+    agg = {}
+    for name in datasets:
+        runs = []
+        for sd in seeds:
+            r = run_dataset(name, hidden=args.hidden, epochs=args.epochs,
+                            seed=sd)
+            runs.append(r)
+            print(f"[ANN] {name:8s} seed={sd:<3d} params={r['params']:6d} | "
+                  f"canonical={r['canonical']:.2f} "
+                  f"train_var={r['train_variant']:.2f} "
+                  f"heldout={r['heldout']:.2f}", flush=True)
+
+        def ms(key):
+            v = np.array([r[key] for r in runs], dtype=float)
+            return float(v.mean()), float(v.std())
+        agg[name] = {
+            "params": runs[0]["params"], "hidden": args.hidden,
+            "n_seeds": len(seeds),
+            "canonical_mean_std": ms("canonical"),
+            "train_variant_mean_std": ms("train_variant"),
+            "heldout_mean_std": ms("heldout"),
+            "heldout_per_seed": [r["heldout"] for r in runs],
+        }
+
+    print(f"\n=== ANN control: {len(seeds)} seeds {seeds} (mean+-std) "
+          f"vs CHM (main_exp_2) ===")
+    print(f"{'dataset':9s} | {'ANN params':10s} {'ANN canon':14s} "
+          f"{'ANN heldout':16s} | {'CHM params':14s} {'CHM variant':11s}")
+    for name, a in agg.items():
+        cm, cs = a["canonical_mean_std"]
+        hm, hs = a["heldout_mean_std"]
+        c = _CHM_REF.get(name, {})
+        print(f"{name:9s} | {a['params']:<10d} {cm:.3f}+-{cs:.3f}    "
+              f"{hm:.3f}+-{hs:.3f}     | {str(c.get('params','?')):14s} "
+              f"{str(c.get('variant','?')):11s}")
     print("\n주: ANN=black-box(가중치 의미 없음), CHM=white-box(지형/궤적 해석가능). "
           "연산량(FLOPs) 비교는 추후.")
+
+    out_path = args.out or os.path.join("research", "ann_control.json")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    json.dump({"seeds": seeds, "hidden": args.hidden, "epochs": args.epochs,
+               "results": agg}, open(out_path, "w"), indent=2)
+    print(f"saved {out_path}")
 
 
 if __name__ == "__main__":

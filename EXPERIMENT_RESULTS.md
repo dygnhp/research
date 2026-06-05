@@ -108,13 +108,14 @@ seed 42/1/2. main_exp_1과 동일 설정. 원본 출력은 research/main_exp_2/ 
 
 ## 7. ANN 대조군 (TensorFlow Sequential, control/ann_baseline.py)
 
-동일 데이터/seed, Flatten -> Dense(32, relu) -> Dense(C, softmax). FLOPs 비교는 추후.
+동일 데이터, Flatten -> Dense(32, relu) -> Dense(C, softmax). **5 seed(42,1,2,3,4)** 평균±std.
+FLOPs 비교는 추후. (원본 research/ann_control.json, gitignore)
 
-| dataset | ANN params | ANN held-out | CHM params | CHM variant |
-|---|---|---|---|---|
-| OX_8 | 2,146 | **100%** | ~434 | 86.3% |
-| ABC_16 | 8,323 | **100%** | ~262 | 93.3% |
-| abcd_32 | 32,932 | **100%** | ~470 | 70.8% |
+| dataset | ANN params | ANN canonical | ANN held-out (평균±std) | CHM params | CHM variant |
+|---|---|---|---|---|---|
+| OX_8 | 2,146 | 100% | **99.4 ± 0.5%** | ~434 | 86.3% |
+| ABC_16 | 8,323 | 100% | **100 ± 0%** | ~262 | 93.3% |
+| abcd_32 | 32,932 | 100% | **100 ± 0%** | ~470 | 70.8% |
 
 - **표준 MLP는 3종 모두 100%** (미학습 held-out 포함). 합성 글자는 black-box ANN엔 사소.
 - **ANN이 abcd a/d도 100% 분리** -> a/d 구분 정보는 **픽셀에 분명히 존재**; CHM의 어려움은 데이터가 아니라 **"거의 동일한 입자구름의 CoM 라우팅"이라는 표현방식의 한계**.
